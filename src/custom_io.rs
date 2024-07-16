@@ -71,7 +71,7 @@ impl<T> CustomIO<T> {
 }
 
 pub struct Input<'a> {
-    inner: ManuallyDrop<FFInput>,
+    inner: FFInput,
     _phantom: PhantomData<&'a ()>,
 }
 
@@ -98,16 +98,14 @@ impl<'a> Input<'a> {
 
             println!("find_stream_info() success");
 
-            // SAFETY: The constructor of FFInput does not do anything.
-            // Its *de*structor, on the other hand, makes assumptions about the contents of the
-            // AVIOContext which are false in our case, and will result in undefined behavior if
-            // executed.
-            // We thus wrap it in a ManuallyDrop so that its destructor never runs, and implement
-            // our own destructor which destroys just the data we want it to.
-            let inner = FFInput::wrap(ptr);
-
+            // FFInput's drop implementation will call avformat_close_input() correctly as it
+            // should.
+            // I will have to get more creative if I want to implement outputs, since the
+            // destructor for FFOutput makes assumptions about the content of the AVIOContext that
+            // are false in our case, and invoking that destructor will cause invalid memory
+            // accesses.
             Ok(Self {
-                inner: ManuallyDrop::new(inner),
+                inner: FFInput::wrap(ptr),
                 _phantom: PhantomData,
             })
         }
@@ -125,15 +123,6 @@ impl std::ops::Deref for Input<'_> {
 impl std::ops::DerefMut for Input<'_> {
     fn deref_mut(&mut self) -> &mut FFInput {
         &mut self.inner
-    }
-}
-
-impl Drop for Input<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            let mut ptr = self.inner.as_mut_ptr();
-            avformat_close_input(&mut ptr);
-        }
     }
 }
 
