@@ -55,7 +55,7 @@ impl<'a, const N: usize> DerefMut for RingBufSlot<'a, N, true> {
 }
 
 fn try_get_slot<'a, const N: usize, const write: bool>(mut guard: RingBufGuard<'a,N>) -> Result<RingBufSlot<'a,N,write>, RingBufGuard<'a,N>> {
-    let can_advance = (guard.read_offset < guard.write_offset) ^ guard.writer_wrapped ^ write;
+    let can_advance = guard.read_offset != guard.write_offset || (write ^ guard.writer_wrapped);
     dbg!(guard.read_offset, guard.write_offset, guard.writer_wrapped, write, can_advance);
     if can_advance {
         let slot = if write {
@@ -82,22 +82,22 @@ fn try_get_slot<'a, const N: usize, const write: bool>(mut guard: RingBufGuard<'
 }
 
 #[derive(Default)]
-struct RingBuf<const N: usize> {
+pub struct RingBuf<const N: usize> {
     inner: Mutex<RingBufInner<N>>,
     condvar: Condvar,
 }
 
-enum TryAcquireError {
+pub enum TryAcquireError {
     ChannelClosed,
     NotReady,
 }
 
-enum AcquireError {
+pub enum AcquireError {
     ChannelClosed,
 }
 
 impl<const N: usize> RingBuf<N> {
-    fn read(&self) -> Result<RingBufSlot<'_,N,false>,AcquireError> {
+    pub fn read(&self) -> Result<RingBufSlot<'_,N,false>,AcquireError> {
         let mut guard = self.inner.lock().unwrap();
         loop {
             guard = match try_get_slot::<N, false>(guard) {
@@ -113,7 +113,7 @@ impl<const N: usize> RingBuf<N> {
         }
     }
 
-    fn try_read(&self) -> Result<RingBufSlot<'_,N,false>,TryAcquireError> {
+    pub fn try_read(&self) -> Result<RingBufSlot<'_,N,false>,TryAcquireError> {
         let guard = self.inner.lock().unwrap();
 
         try_get_slot::<N, false>(guard).map_err(|guard| 
@@ -121,7 +121,7 @@ impl<const N: usize> RingBuf<N> {
             )
     }
 
-    fn write(&self) -> Result<RingBufSlot<'_,N,true>,AcquireError> {
+    pub fn write(&self) -> Result<RingBufSlot<'_,N,true>,AcquireError> {
         let mut guard = self.inner.lock().unwrap();
         loop {
             if guard.reader_closed {
@@ -134,7 +134,7 @@ impl<const N: usize> RingBuf<N> {
         }
     }
 
-    fn try_write(&self) -> Result<RingBufSlot<'_,N,true>,TryAcquireError> {
+    pub fn try_write(&self) -> Result<RingBufSlot<'_,N,true>,TryAcquireError> {
         let guard = self.inner.lock().unwrap();
         if guard.reader_closed {
             return Err(TryAcquireError::ChannelClosed);
@@ -150,7 +150,7 @@ mod test {
     use super::*;
     #[test]
     fn test_ringbuf_one_slot() {
-        let mut ringbuf = RingBuf::<1>::default();
+        let ringbuf = RingBuf::<1>::default();
         assert!(ringbuf.try_read().is_err());
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_write().is_err());
@@ -161,12 +161,16 @@ mod test {
 
     #[test]
     fn test_ringbuf_multi_slot() {
-        let mut ringbuf = RingBuf::<3>::default();
+        let ringbuf = RingBuf::<3>::default();
         assert!(ringbuf.try_read().is_err());
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_write().is_err());
+        assert!(ringbuf.try_read().is_ok());
+        assert!(ringbuf.try_read().is_ok());
+        assert!(ringbuf.try_write().is_ok());
+        assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_read().is_ok());
         assert!(ringbuf.try_read().is_ok());
         assert!(ringbuf.try_read().is_ok());
