@@ -267,6 +267,14 @@ mod test {
         assert!(ringbuf.try_read().is_ok());
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_read().is_ok());
+        ringbuf.try_write().unwrap().do_not_consume();
         assert!(ringbuf.try_read().is_err());
+
+        
+        assert!(ringbuf.try_write().is_ok());
+        assert!(ringbuf.try_write().is_ok());
+        assert!(ringbuf.try_write().is_ok());
+        ringbuf.try_read().unwrap().do_not_consume();
+        assert!(ringbuf.try_write().is_err());
     }
 }
