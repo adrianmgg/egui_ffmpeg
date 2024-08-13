@@ -71,6 +71,21 @@ impl<'a, T> RingBufSlot<'a, T,true> {
     */
 }
 
+impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
+
+    /**
+     * Inform the ring buffer that the calling code did not do anything with this slot.  This same
+     * slot will be returned again the next time read() or write() is called.
+     */
+    pub fn do_not_consume(mut self) {
+        if WRITE {
+            self.guard.write_offset = self.slot;
+        } else {
+            self.guard.read_offset = self.slot;
+        }
+    }
+}
+
 fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>) -> Result<RingBufSlot<'a, T, WRITE>, RingBufGuard<'a, T>> {
     let can_advance = guard.read_offset != guard.write_offset || (WRITE ^ guard.writer_wrapped);
     dbg!(guard.read_offset, guard.write_offset, guard.writer_wrapped, WRITE, can_advance);
@@ -191,6 +206,9 @@ mod test {
         assert!(ringbuf.try_read().is_err());
         *ringbuf.try_write().unwrap() = 1;
         *ringbuf.try_write().unwrap() = 2;
+        let mut s = ringbuf.try_write().unwrap();
+        *s = 2;
+        s.do_not_consume();
         *ringbuf.try_write().unwrap() = 3;
         assert!(ringbuf.try_write().is_err());
         assert_eq!(*ringbuf.try_read().unwrap(), 1);
@@ -198,6 +216,9 @@ mod test {
         *ringbuf.try_write().unwrap() = 4;
         *ringbuf.try_write().unwrap() = 5;
         assert_eq!(*ringbuf.try_read().unwrap(), 3);
+        let s = ringbuf.try_read().unwrap();
+        assert_eq!(*s, 4);
+        s.do_not_consume();
         assert_eq!(*ringbuf.try_read().unwrap(), 4);
         assert_eq!(*ringbuf.try_read().unwrap(), 5);
         assert!(ringbuf.try_read().is_err());
