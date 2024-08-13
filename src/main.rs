@@ -3,6 +3,7 @@
 
 use std::io::{Read, Seek};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ffmpeg_the_third::format::{Pixel, Sample};
 use ffmpeg_the_third::ChannelLayoutMask;
@@ -59,6 +60,46 @@ impl<T> _OptionExt<T> for Option<T> {
     }
 }
 
+struct AudioPlayer {
+    queue: Arc<RingBuf<AudioFrame>>,
+    offset_into_current_slot: usize,
+}
+
+impl AudioPlayer {
+    fn new(queue: Arc<RingBuf<AudioFrame>>) -> Self {
+        Self {
+            queue,
+            offset_into_current_slot: 0,
+        }
+    }
+
+    fn output(&mut self, mut output_buffer: &mut [u8]) -> bool {
+        while !output_buffer.is_empty() {
+            match self.queue.read() {
+                Ok(frame) => {
+                    if frame.planes()==0 {
+                        continue;
+                    }
+                    let input_data = &frame.data(0)[self.offset_into_current_slot..];
+                    self.offset_into_current_slot=0;
+                    if input_data.len() > output_buffer.len() {
+                        output_buffer.copy_from_slice(&input_data[..output_buffer.len()]);
+                        self.offset_into_current_slot = output_buffer.len();
+                        return false;
+                    }
+                    output_buffer[..input_data.len()].copy_from_slice(input_data);
+                    output_buffer = &mut output_buffer[input_data.len()..];
+                },
+                Err(_) => {
+                    // TODO fill the rest of the sample with equilibrium data.
+                    return true;
+                },
+            }
+        }
+        false
+    }
+}
+
 fn main() {
     let f = std::fs::File::open("/home/vsparks/Videos/lagtrain.webm").unwrap();
     //let data = std::fs::read("/home/vsparks/Videos/lagtrain.webm").unwrap();
@@ -81,7 +122,7 @@ fn main() {
 
     let mut audio_machinery: Option<StreamSink<AudioFrame>> = None;
 
-    #[allow(unused)]
+    #[allow(unused,unused_assignments)]
     let mut audio_output_stream = None;
 
     if let Some(ffstream) = &audio_stream {
@@ -90,8 +131,8 @@ fn main() {
         println!("created audio decoder");
         let host = cpal::default_host();
         if let Some(device) = host.default_output_device() {
-            let queue = Arc::new(RingBuf::new(10, || AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all())));
-            let queue_consumer = queue.clone();
+            let queue = Arc::new(RingBuf::new(3, || AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all())));
+            let mut queue_consumer = AudioPlayer::new(queue.clone());
             let queue_closer = queue.clone();
             let res = device.build_output_stream_raw(
                 &cpal::StreamConfig {
@@ -109,14 +150,15 @@ fn main() {
                     Sample::F64(_) => cpal::SampleFormat::F64,
                 },
                 move |data, info| {
-                    dbg!(info);
-                    data.bytes_mut().copy_from_slice(queue_consumer.read().ok().expect("end of stream").data(0));
+                    if queue_consumer.output(data.bytes_mut()) {
+                        // todo shut down the stream
+                    }
                 }, 
                 move |error| {
                     eprintln!("audio decode error: {}", error);
                     queue_closer.close_read();
                 },
-                None,
+                Some(Duration::from_millis(200)),
             );
             match res {
                 Ok(stream) => {
@@ -150,7 +192,7 @@ fn main() {
                 match video_decoder.receive_frame(&mut frame) {
                     Ok(()) => {
                         frames += 1;
-                        if frames < 1000 {
+                        if frames < 10000 {
                             continue;
                         }
                         scaler.run(&frame, &mut converted_frame).expect("error converting frame");
@@ -168,6 +210,7 @@ fn main() {
             if let Some(machinery) = &mut audio_machinery {
                 if stream.index() == machinery.stream_idx {
                     machinery.decoder.send_packet(&packet).expect("error decoding packet");
+                    let mut count=0;
                     loop {
                         let mut slot = match machinery.output_queue.write() {
                             Ok(x) => x,
@@ -177,9 +220,18 @@ fn main() {
                             },
                         };
                         match machinery.decoder.receive_frame(&mut *slot) {
-                            Ok(()) => {},
+                            Ok(()) => {
+                                if slot.planes() == 0 {
+                                    println!("decoder produced an empty frame");
+                                    slot.do_not_consume();
+                                } else {
+                                    println!("filled slot {}", slot.slot);
+                                }
+                                count+=1;
+                            },
                             Err(ffmpeg::Error::Eof) => {
                                 machinery.output_queue.close_write();
+                                audio_stop=true;
                             },
                             Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => {
                                 slot.do_not_consume();
