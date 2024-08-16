@@ -136,7 +136,7 @@ fn main() {
             let mut queue_consumer = AudioPlayer::new(queue.clone());
             let res = device.build_output_stream_raw(
                 &cpal::StreamConfig {
-                    channels: audio_decoder.ch_layout().channels() as u16,
+                    channels:  audio_decoder.ch_layout().channels() as u16,
                     sample_rate: cpal::SampleRate(audio_decoder.rate()),
                     buffer_size: cpal::BufferSize::Default,
                 },

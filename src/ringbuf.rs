@@ -39,6 +39,7 @@ pub struct RingBufSlot<'a, T, const Writable: bool> {
     guard: RingBufGuard<'a, T>,
     pub slot: usize,
     caused_wrap: bool,
+    condvar: Option<&'a Condvar>,
 }
 
 impl<'a, T, const Writable: bool> Deref for RingBufSlot<'a, T, Writable> {
@@ -72,6 +73,14 @@ impl<'a, T> RingBufSlot<'a, T,true> {
     */
 }
 
+impl<'a, T, const WRITE: bool> Drop for RingBufSlot<'a,T,WRITE> {
+    fn drop(&mut self) {
+        if let Some(condvar) = self.condvar {
+            condvar.notify_one();
+        }
+    }
+}
+
 impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
 
     /**
@@ -80,18 +89,21 @@ impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
      */
     pub fn do_not_consume(mut self) {
         if WRITE {
+            eprintln!("write not consumed");
             self.guard.write_offset = self.slot;
             if self.caused_wrap {
                 debug_assert!(self.guard.writer_wrapped);
                 self.guard.writer_wrapped=false;
             }
         } else {
+            eprintln!("read not consumed");
             self.guard.read_offset = self.slot;
             if self.caused_wrap {
                 debug_assert!(!self.guard.writer_wrapped);
                 self.guard.writer_wrapped=true;
             }
         }
+        self.condvar=None;
     }
 }
 
@@ -118,7 +130,7 @@ fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>) -> Res
             }
             slot
         };
-        Ok(RingBufSlot{guard, slot, caused_wrap})
+        Ok(RingBufSlot{guard, slot, caused_wrap, condvar:None})
     } else {
         Err(guard)
     }
@@ -126,14 +138,16 @@ fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>) -> Res
 
 pub struct RingBuf<T> {
     inner: Mutex<RingBufInner<T>>,
-    condvar: Condvar,
+    read_ready: Condvar,
+    write_ready: Condvar,
 }
 
 impl<T> RingBuf<T> {
     pub fn new(size: usize, init: impl FnMut()->T) -> Self {
         Self {
             inner: Mutex::new(RingBufInner::new(size, init)),
-            condvar: Condvar::new(),
+            read_ready: Condvar::new(),
+            write_ready: Condvar::new(),
         }
     }
 }
@@ -152,22 +166,24 @@ pub enum AcquireError {
 impl<T> RingBuf<T> {
     pub fn read(&self) -> Result<RingBufSlot<'_,T,false>,AcquireError> {
         let mut guard = self.inner.lock().unwrap();
-        loop {
+        for i in 1usize.. {
             guard = match try_get_slot::<T, false>(guard) {
-                Ok(res) => {
-                    // TODO separate read and write condvars.
-                    self.condvar.notify_one();
+                Ok(mut res) => {
+                    eprintln!("read  ok, slot {}", res.slot);
+                    res.condvar = Some(&self.write_ready);
                     return Ok(res)
                 },
                 Err(guard) => {
+                    eprintln!("queue underrun x{}", i);
                     if guard.writer_closed {
                         return Err(AcquireError::ChannelClosed);
                     } else {
-                        self.condvar.wait(guard).unwrap()
+                        self.read_ready.wait(guard).unwrap()
                     }
                 },
             }
         }
+        loop{}
     }
 
     pub fn try_read(&self) -> Result<RingBufSlot<'_,T,false>,TryAcquireError> {
@@ -176,26 +192,31 @@ impl<T> RingBuf<T> {
         let r = try_get_slot::<T, false>(guard).map_err(|guard| 
             if guard.writer_closed {TryAcquireError::ChannelClosed} else {TryAcquireError::NotReady}
             );
-        if r.is_ok() {
-            self.condvar.notify_one();
-        }
-        r
+        r.map(|mut x| {
+            x.condvar = Some(&self.write_ready);
+            x
+            })
     }
 
     pub fn write(&self) -> Result<RingBufSlot<'_,T,true>,AcquireError> {
         let mut guard = self.inner.lock().unwrap();
-        loop {
+        for i in 1.. {
             if guard.reader_closed {
                 return Err(AcquireError::ChannelClosed);
             }
             guard = match try_get_slot::<T, true>(guard) {
-                Ok(res) => {
-                    self.condvar.notify_one();
+                Ok(mut res) => {
+                    res.condvar = Some(&self.read_ready);
+                    eprintln!("write ok, slot {}", res.slot);
                     return Ok(res)
                 },
-                Err(guard) => self.condvar.wait(guard).unwrap(),
+                Err(guard) => {
+                    eprintln!("queue overrun x{i}");
+                    self.write_ready.wait(guard).unwrap()
+                },
             }
         }
+        loop {}
     }
 
     pub fn try_write(&self) -> Result<RingBufSlot<'_,T,true>,TryAcquireError> {
@@ -205,10 +226,10 @@ impl<T> RingBuf<T> {
         }
 
         let r = try_get_slot(guard).map_err(|_| TryAcquireError::NotReady);
-        if r.is_ok() {
-            self.condvar.notify_one();
-        }
-        r
+        r.map(|mut x| {
+            x.condvar = Some(&self.read_ready);
+            x
+        })
     }
 
     pub fn close_read(&self) {
