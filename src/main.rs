@@ -43,7 +43,7 @@ impl<T:Seek> Seek for BadReadWrapper<T> {
 struct StreamSink<T> {
     stream_idx: usize,
     decoder: Decoder,
-    //processing_step: Option<(T, Box<dyn FnMut(&T, &mut T)>)>,
+    processing_step: Option<(T, Box<dyn FnMut(&T, &mut T)>)>,
     output_queue: Arc<RingBuf<T>>,
 }
 
@@ -85,6 +85,7 @@ impl AudioPlayer {
                     if input_data.len() > output_buffer.len() {
                         output_buffer.copy_from_slice(&input_data[..output_buffer.len()]);
                         self.offset_into_current_slot = output_buffer.len();
+                        frame.do_not_consume();
                         return false;
                     }
                     output_buffer[..input_data.len()].copy_from_slice(input_data);
@@ -101,10 +102,10 @@ impl AudioPlayer {
 }
 
 fn main() {
-    let f = std::fs::File::open("/home/vsparks/Videos/lagtrain.webm").unwrap();
+    let f = std::fs::File::open("/home/vsparks/Videos/most fashionable faction.webm").unwrap();
     //let data = std::fs::read("/home/vsparks/Videos/lagtrain.webm").unwrap();
     //let f = std::io::Cursor::new(data);
-    let mut cio = custom_io::CustomIO::new_read_seekable(f);
+    let mut cio = custom_io::CustomIO::new_read_nonseekable(f);
     let mut input = cio.open_input().unwrap();
     unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
     println!("format name is {}", input.format().name());
@@ -133,13 +134,13 @@ fn main() {
         if let Some(device) = host.default_output_device() {
             let queue = Arc::new(RingBuf::new(3, || AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all())));
             let mut queue_consumer = AudioPlayer::new(queue.clone());
-            let queue_closer = queue.clone();
             let res = device.build_output_stream_raw(
                 &cpal::StreamConfig {
                     channels: audio_decoder.ch_layout().channels() as u16,
                     sample_rate: cpal::SampleRate(audio_decoder.rate()),
                     buffer_size: cpal::BufferSize::Default,
                 },
+                // TODO handle the case where the audio driver can't accept this sample format.
                 match audio_decoder.format() {
                     Sample::None => todo!(),
                     Sample::U8(_) => cpal::SampleFormat::U8,
@@ -156,17 +157,42 @@ fn main() {
                 }, 
                 move |error| {
                     eprintln!("audio decode error: {}", error);
-                    queue_closer.close_read();
+                    // errors here are usually non fatal, so we don't close the stream here.
                 },
-                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(200)), // arbitrarily chosen
             );
             match res {
                 Ok(stream) => {
                     stream.play().unwrap();
                     println!("audio stream started");
+                    use ffmpeg::util::format::sample::Type;
+                    let sample_repack_to = match audio_decoder.format() {
+                        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
+                        Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
+                        Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
+                        Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
+                        Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
+                        Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
+                        _ => None,
+                    };
+
+                    let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
+
+                    let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {repacker.run(input, output).expect("resampler failed");}));
+
+                    // bizarre workaround for what i can only assume is a compiler bug
+                    // TODO report this to the rustc team.
+                    let func = processing_step.map(|a| {
+                        let b: Box<dyn FnMut(&AudioFrame, &mut AudioFrame)+'static> = a;
+                        b
+                    });
+
+                    let processing_step = func.map(|func| (AudioFrame::empty(), func));
+                        
                     audio_machinery = Some(StreamSink {
                         stream_idx: ffstream.index(),
                         decoder: audio_decoder.0,
+                        processing_step,
                         output_queue: queue,
                     });
                     audio_output_stream = Some(stream);
@@ -210,7 +236,6 @@ fn main() {
             if let Some(machinery) = &mut audio_machinery {
                 if stream.index() == machinery.stream_idx {
                     machinery.decoder.send_packet(&packet).expect("error decoding packet");
-                    let mut count=0;
                     loop {
                         let mut slot = match machinery.output_queue.write() {
                             Ok(x) => x,
@@ -219,15 +244,16 @@ fn main() {
                                 break;
                             },
                         };
-                        match machinery.decoder.receive_frame(&mut *slot) {
+                        let res = if let Some((frame, _)) = &mut machinery.processing_step {
+                            machinery.decoder.receive_frame(frame)
+                        } else {
+                            machinery.decoder.receive_frame(&mut *slot)
+                        };
+                        match res {
                             Ok(()) => {
-                                if slot.planes() == 0 {
-                                    println!("decoder produced an empty frame");
-                                    slot.do_not_consume();
-                                } else {
-                                    println!("filled slot {}", slot.slot);
+                                if let Some((frame, process)) = &mut machinery.processing_step {
+                                    process(frame, &mut *slot);
                                 }
-                                count+=1;
                             },
                             Err(ffmpeg::Error::Eof) => {
                                 machinery.output_queue.close_write();
