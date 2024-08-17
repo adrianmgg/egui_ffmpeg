@@ -97,9 +97,9 @@ impl AudioPlayer {
                 },
             }
         }
-        println!("output lined up exactly!");
         false
     }
+    
 }
 
 fn main() {
@@ -133,7 +133,23 @@ fn main() {
         println!("created audio decoder");
         let host = cpal::default_host();
         if let Some(device) = host.default_output_device() {
-            let queue = Arc::new(RingBuf::new(20, || AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all())));
+            use ffmpeg::util::format::sample::Type;
+            let sample_repack_to = match audio_decoder.format() {
+                Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
+                Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
+                Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
+                Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
+                Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
+                Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
+                _ => None,
+            };
+
+            let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
+
+            let channel_layout = repacker.as_ref().map(|r| r.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
+
+
+            let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
             let bytes_per_sample = match audio_decoder.format() {
                 Sample::None => 0,
                 Sample::U8(_) => 1,
@@ -175,22 +191,17 @@ fn main() {
                 Ok(stream) => {
                     stream.play().unwrap();
                     println!("audio stream started");
-                    use ffmpeg::util::format::sample::Type;
-                    let sample_repack_to = match audio_decoder.format() {
-                        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
-                        Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
-                        Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
-                        Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
-                        Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
-                        Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
-                        _ => None,
-                    };
-
-                    let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
-
                     let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
-                        repacker.run(input, output).expect("resampler failed");
-                        //dbg!(input.pts(), output.pts());
+                        // operations are done in this order to reduce the probability of overflow while preserving as much precision as possible.
+                        let input_pts = ((input.pts().unwrap() * repacker.input().rate as i64) / 1000) * repacker.output().rate as i64;
+                        let next_pts = unsafe {ffmpeg::ffi::swr_next_pts(repacker.as_mut_ptr(), input_pts)};
+                        let next_pts = ((next_pts / repacker.output().rate as i64) * 1000) / repacker.input().rate as i64;
+                        output.set_samples(0); // ensure that ffmpeg will put the number of samples into this buffer, instead of treating it as an input.
+                        let delay = repacker.run(input, output).expect("resampler failed");
+                        dbg!(delay);
+                        output.set_pts(Some(next_pts));
+                        dbg!(input.pts(), output.pts());
+                        dbg!(input.samples(), output.samples());
                     }));
 
                     // bizarre workaround for what i can only assume is a compiler bug
