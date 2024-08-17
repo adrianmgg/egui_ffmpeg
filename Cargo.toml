@@ -1,0 +1,13 @@
+[package]
+name = "ffmpeg-player"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = "1.16.1"
+cpal = "0.15.3"
+#eframe = { version = "0.28.1", default-features = false, features = ["wayland", "wgpu", "default_fonts"] }
+#egui = "0.28.1"
+ffmpeg-the-third = {version="2.0.1"}#, path="ffmpeg-the-third"}
+hound = "3.5.1"
+image = { version = "0.25.1", default-features = false, features = ["png"] }
