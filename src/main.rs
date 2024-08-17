@@ -79,7 +79,8 @@ impl AudioPlayer {
         while !output_buffer.is_empty() {
             match self.queue.read() {
                 Ok(frame) => {
-                    let input_data = &frame.data(0)[self.offset_into_current_slot..];
+                    let total_len = frame.samples() * self.bytes_per_sample;
+                    let input_data = &frame.data(0)[self.offset_into_current_slot..total_len];
                     self.offset_into_current_slot=0;
                     if input_data.len() > output_buffer.len() {
                         output_buffer.copy_from_slice(&input_data[..output_buffer.len()]);
@@ -123,7 +124,6 @@ fn main() {
 
     let mut audio_machinery: Option<StreamSink<AudioFrame>> = None;
 
-    /*
     #[allow(unused,unused_assignments)]
     let mut audio_output_stream = None;
 
@@ -134,7 +134,16 @@ fn main() {
         let host = cpal::default_host();
         if let Some(device) = host.default_output_device() {
             let queue = Arc::new(RingBuf::new(20, || AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all())));
-            let mut queue_consumer = AudioPlayer::new(queue.clone());
+            let bytes_per_sample = match audio_decoder.format() {
+                Sample::None => 0,
+                Sample::U8(_) => 1,
+                Sample::I16(_) => 2,
+                Sample::I32(_) => 4,
+                Sample::I64(_) => 8,
+                Sample::F32(_) => 4,
+                Sample::F64(_) => 8,
+            };
+            let mut queue_consumer = AudioPlayer::new(queue.clone(), bytes_per_sample * audio_decoder.ch_layout().channels() as usize);
             let res = device.build_output_stream_raw(
                 &cpal::StreamConfig {
                     channels: audio_decoder.ch_layout().channels() as u16,
@@ -208,8 +217,8 @@ fn main() {
             }
         }
     };
-*/
 
+    /*
     let mut o = if let Some(ffstream) = &audio_stream {
         let audio_ctx = ffmpeg::codec::Context::from_parameters(ffstream.parameters()).expect("unable to create audio context");
         let audio_decoder = audio_ctx.decoder().audio().expect("unable to create audio decoder");
@@ -229,6 +238,7 @@ fn main() {
     } else {
         None
     };
+    */
 
     let mut frame = VideoFrame::empty();
     let mut converted_frame = VideoFrame::empty();
@@ -260,7 +270,6 @@ fn main() {
                 }
             }
         } else */{
-            /*
             let mut audio_stop=false;
             if let Some(machinery) = &mut audio_machinery {
                 if stream.index() == machinery.stream_idx {
@@ -303,14 +312,14 @@ fn main() {
             if audio_stop {
                 audio_machinery = None;
             }
-            */
+            /*
             if let Some((idx, ref mut in_frame, ref mut out_frame, ref mut audio_decoder, ref mut repacker, ref mut writer)) = o {
                 if stream.index() == idx {
                     audio_decoder.send_packet(&packet).expect("error decoding packet");
                     loop {
                         match audio_decoder.receive_frame(in_frame) {
                             Ok(()) => {
-                                let mut out_frame = AudioFrame::empty();
+                                let mut out_frame = AudioFrame::new(repacker.output().format, 44100, repacker.output().channel_layout);
                                 repacker.run(in_frame, &mut out_frame).expect("error resampling audio");
                                 let full_data = bytemuck::cast_slice::<_,f32>(out_frame.data(0));
                                 let data = &full_data[..out_frame.samples()*audio_decoder.ch_layout().channels() as usize];
@@ -332,6 +341,7 @@ fn main() {
                     }
                 }
             }
+            */
         }
     }
 }
