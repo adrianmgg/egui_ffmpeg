@@ -229,45 +229,20 @@ fn main() {
         }
     };
 
-    /*
-    let mut o = if let Some(ffstream) = &audio_stream {
-        let audio_ctx = ffmpeg::codec::Context::from_parameters(ffstream.parameters()).expect("unable to create audio context");
-        let audio_decoder = audio_ctx.decoder().audio().expect("unable to create audio decoder");
-        use ffmpeg::util::format::sample::Type;
-        let repacker = audio_decoder.resampler2(Sample::F32(Type::Packed), audio_decoder.ch_layout(), audio_decoder.rate()).expect("unable to create audio resampler");
-        let writer = hound::WavWriter::new(std::io::BufWriter::new(std::fs::File::create("audio.wav").expect("unable to create audio dump file")),
-                    hound::WavSpec {
-                        channels: audio_decoder.ch_layout().channels() as u16,
-                        bits_per_sample: 32,
-                        sample_format: hound::SampleFormat::Float,
-                        sample_rate: audio_decoder.rate(),
-                    }
-        ).expect("unable to create wav writer");
-        let in_frame = AudioFrame::new(audio_decoder.format(), audio_decoder.frame_size() as usize, ChannelLayoutMask::all());
-        let out_frame = AudioFrame::empty();//new(Sample::F32(Type::Packed), audio_decoder.frame_size() as usize, ChannelLayoutMask::all());
-        Some((ffstream.index(), in_frame, out_frame, audio_decoder, repacker, writer))
-    } else {
-        None
-    };
-    */
-
     let mut frame = VideoFrame::empty();
     let mut converted_frame = VideoFrame::empty();
 
     let mut frames=0;
 
-    let mut reused_audio_out_frame = AudioFrame::empty();
-
     for packet in input.packets() {
         let (stream, packet) = packet.expect("error reading packet");
-        /*
         if stream.index() == video_stream_idx {
             video_decoder.send_packet(&packet).expect("error decoding packet");
             loop {
                 match video_decoder.receive_frame(&mut frame) {
                     Ok(()) => {
                         frames += 1;
-                        if frames < 1000 {
+                        if frames < 100 {
                             continue;
                         }
                         scaler.run(&frame, &mut converted_frame).expect("error converting frame");
@@ -280,7 +255,7 @@ fn main() {
                     Err(e) => panic!("error decoding frame: {}", e),
                 }
             }
-        } else */{
+        } else {
             let mut audio_stop=false;
             if let Some(machinery) = &mut audio_machinery {
                 if stream.index() == machinery.stream_idx {
@@ -323,36 +298,6 @@ fn main() {
             if audio_stop {
                 audio_machinery = None;
             }
-            /*
-            if let Some((idx, ref mut in_frame, ref mut out_frame, ref mut audio_decoder, ref mut repacker, ref mut writer)) = o {
-                if stream.index() == idx {
-                    audio_decoder.send_packet(&packet).expect("error decoding packet");
-                    loop {
-                        match audio_decoder.receive_frame(in_frame) {
-                            Ok(()) => {
-                                let mut out_frame = AudioFrame::new(repacker.output().format, 44100, repacker.output().channel_layout);
-                                repacker.run(in_frame, &mut out_frame).expect("error resampling audio");
-                                let full_data = bytemuck::cast_slice::<_,f32>(out_frame.data(0));
-                                let data = &full_data[..out_frame.samples()*audio_decoder.ch_layout().channels() as usize];
-                                    dbg!(full_data.len(),data.len());
-                                for sample in data.iter().copied() {
-                                    //eprintln!("sample in bounds. {} {:x}", sample, sample.to_bits());
-                                    writer.write_sample(sample).unwrap();
-                                }
-                                frames+=1;
-                                if frames>10 {
-                                return;
-                                }
-                            },
-                            Err(ffmpeg::Error::Eof) | Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => break,
-                            Err(e) => {
-                                panic!("error decoding audio: {}", e);
-                            },
-                        }
-                    }
-                }
-            }
-            */
         }
     }
 }
