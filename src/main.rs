@@ -45,6 +45,7 @@ struct StreamSink<T> {
     decoder: Decoder,
     processing_step: Option<(T, Box<dyn FnMut(&T, &mut T)>)>,
     output_queue: Arc<RingBuf<T>>,
+    audio_stream: Option<cpal::Stream>,
 }
 
 trait _OptionExt<T> {
@@ -99,7 +100,111 @@ impl AudioPlayer {
         }
         false
     }
-    
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AudioOutputError {
+    #[error("error creating codec")]
+    CreatingCodec(ffmpeg::Error),
+    #[error("error creating decoder")]
+    CreatingDecoder(ffmpeg::Error),
+    #[error("no audio output device")]
+    NoAudioOutputDevice,
+    #[error("error creating audio output stream")]
+    BuildStreamError(#[from] cpal::BuildStreamError),
+}
+
+pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Parameters) -> Result<StreamSink<AudioFrame>, AudioOutputError> {
+    let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
+    let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
+    println!("created audio decoder");
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or(AudioOutputError::NoAudioOutputDevice)?;
+
+    use ffmpeg::util::format::sample::Type;
+    let sample_repack_to = match audio_decoder.format() {
+        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
+        Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
+        Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
+        Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
+        Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
+        Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
+        _ => None,
+    };
+
+    let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
+
+    let channel_layout = repacker.as_ref().map(|r| r.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
+
+
+    let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
+    let bytes_per_sample = match audio_decoder.format() {
+        Sample::None => 0,
+        Sample::U8(_) => 1,
+        Sample::I16(_) => 2,
+        Sample::I32(_) => 4,
+        Sample::I64(_) => 8,
+        Sample::F32(_) => 4,
+        Sample::F64(_) => 8,
+    };
+    let mut queue_consumer = AudioPlayer::new(queue.clone(), bytes_per_sample * audio_decoder.ch_layout().channels() as usize);
+    let stream = device.build_output_stream_raw(
+        &cpal::StreamConfig {
+            channels: audio_decoder.ch_layout().channels() as u16,
+            sample_rate: cpal::SampleRate(audio_decoder.rate()),
+            buffer_size: cpal::BufferSize::Default,
+        },
+        // TODO handle the case where the audio driver can't accept this sample format.
+        match audio_decoder.format() {
+            Sample::None => todo!(),
+            Sample::U8(_) => cpal::SampleFormat::U8,
+            Sample::I16(_) => cpal::SampleFormat::I16,
+            Sample::I32(_) => cpal::SampleFormat::I32,
+            Sample::I64(_) => cpal::SampleFormat::I64,
+            Sample::F32(_) => cpal::SampleFormat::F32,
+            Sample::F64(_) => cpal::SampleFormat::F64,
+        },
+        move |data, info| {
+            if queue_consumer.output(data.bytes_mut()) {
+                // todo shut down the stream
+            }
+        }, 
+        move |error| {
+            eprintln!("audio decode error: {}", error);
+            // errors here are usually non fatal, so we don't close the stream here.
+        },
+        Some(Duration::from_millis(200)), // arbitrarily chosen
+        )?;
+    stream.play().unwrap();
+    println!("audio stream started");
+    let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
+        // operations are done in this order to reduce the probability of overflow while preserving as much precision as possible.
+        let input_pts = ((input.pts().unwrap() * repacker.input().rate as i64) / 1000) * repacker.output().rate as i64;
+        let next_pts = unsafe {ffmpeg::ffi::swr_next_pts(repacker.as_mut_ptr(), input_pts)};
+        let next_pts = ((next_pts / repacker.output().rate as i64) * 1000) / repacker.input().rate as i64;
+        output.set_samples(0); // ensure that ffmpeg will put the number of samples into this buffer, instead of treating it as an input.
+        repacker.run(input, output).expect("resampler failed");
+        output.set_pts(Some(next_pts));
+    }));
+
+        // bizarre workaround for what i can only assume is a compiler bug
+        // TODO report this to the rustc team.
+        let func = processing_step.map(|a| {
+            let b: Box<dyn FnMut(&AudioFrame, &mut AudioFrame)+'static> = a;
+            b
+        });
+
+        let processing_step = func.map(|func| (AudioFrame::empty(), func));
+
+        Ok(StreamSink {
+            stream_idx,
+            decoder: audio_decoder.0,
+            processing_step,
+            output_queue: queue,
+            audio_stream: Some(stream),
+        })
+
+
 }
 
 fn main() {
@@ -122,112 +227,13 @@ fn main() {
 
     let audio_stream = input.streams().best(Type::Audio);
 
-    let mut audio_machinery: Option<StreamSink<AudioFrame>> = None;
-
-    #[allow(unused,unused_assignments)]
-    let mut audio_output_stream = None;
-
-    if let Some(ffstream) = &audio_stream {
-        let audio_ctx = ffmpeg::codec::Context::from_parameters(ffstream.parameters()).expect("unable to create audio context");
-        let audio_decoder = audio_ctx.decoder().audio().expect("unable to create audio decoder");
-        println!("created audio decoder");
-        let host = cpal::default_host();
-        if let Some(device) = host.default_output_device() {
-            use ffmpeg::util::format::sample::Type;
-            let sample_repack_to = match audio_decoder.format() {
-                Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
-                Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
-                Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
-                Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
-                Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
-                Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
-                _ => None,
-            };
-
-            let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
-
-            let channel_layout = repacker.as_ref().map(|r| r.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
-
-
-            let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
-            let bytes_per_sample = match audio_decoder.format() {
-                Sample::None => 0,
-                Sample::U8(_) => 1,
-                Sample::I16(_) => 2,
-                Sample::I32(_) => 4,
-                Sample::I64(_) => 8,
-                Sample::F32(_) => 4,
-                Sample::F64(_) => 8,
-            };
-            let mut queue_consumer = AudioPlayer::new(queue.clone(), bytes_per_sample * audio_decoder.ch_layout().channels() as usize);
-            let res = device.build_output_stream_raw(
-                &cpal::StreamConfig {
-                    channels: audio_decoder.ch_layout().channels() as u16,
-                    sample_rate: cpal::SampleRate(audio_decoder.rate()),
-                    buffer_size: cpal::BufferSize::Default,
-                },
-                // TODO handle the case where the audio driver can't accept this sample format.
-                match audio_decoder.format() {
-                    Sample::None => todo!(),
-                    Sample::U8(_) => cpal::SampleFormat::U8,
-                    Sample::I16(_) => cpal::SampleFormat::I16,
-                    Sample::I32(_) => cpal::SampleFormat::I32,
-                    Sample::I64(_) => cpal::SampleFormat::I64,
-                    Sample::F32(_) => cpal::SampleFormat::F32,
-                    Sample::F64(_) => cpal::SampleFormat::F64,
-                },
-                move |data, info| {
-                    if queue_consumer.output(data.bytes_mut()) {
-                        // todo shut down the stream
-                    }
-                }, 
-                move |error| {
-                    eprintln!("audio decode error: {}", error);
-                    // errors here are usually non fatal, so we don't close the stream here.
-                },
-                Some(Duration::from_millis(200)), // arbitrarily chosen
-            );
-            match res {
-                Ok(stream) => {
-                    stream.play().unwrap();
-                    println!("audio stream started");
-                    let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
-                        // operations are done in this order to reduce the probability of overflow while preserving as much precision as possible.
-                        let input_pts = ((input.pts().unwrap() * repacker.input().rate as i64) / 1000) * repacker.output().rate as i64;
-                        let next_pts = unsafe {ffmpeg::ffi::swr_next_pts(repacker.as_mut_ptr(), input_pts)};
-                        let next_pts = ((next_pts / repacker.output().rate as i64) * 1000) / repacker.input().rate as i64;
-                        output.set_samples(0); // ensure that ffmpeg will put the number of samples into this buffer, instead of treating it as an input.
-                        let delay = repacker.run(input, output).expect("resampler failed");
-                        dbg!(delay);
-                        output.set_pts(Some(next_pts));
-                        dbg!(input.pts(), output.pts());
-                        dbg!(input.samples(), output.samples());
-                    }));
-
-                    // bizarre workaround for what i can only assume is a compiler bug
-                    // TODO report this to the rustc team.
-                    let func = processing_step.map(|a| {
-                        let b: Box<dyn FnMut(&AudioFrame, &mut AudioFrame)+'static> = a;
-                        b
-                    });
-
-                    let processing_step = func.map(|func| (AudioFrame::empty(), func));
-                        
-                    audio_machinery = Some(StreamSink {
-                        stream_idx: ffstream.index(),
-                        decoder: audio_decoder.0,
-                        processing_step,
-                        output_queue: queue,
-                    });
-                    audio_output_stream = Some(stream);
-
-                },
-                Err(e) => {
-                    eprintln!("Could not build the audio stream! {}", e);
-                }
-            }
+    let mut audio_machinery: Option<StreamSink<AudioFrame>> = audio_stream.as_ref().and_then(|stream| {
+        let res = create_audio_output(stream.index(), stream.parameters());
+        if let Err(e) = &res {
+            eprintln!("unable to create audio output: {}.  playing video only.", e);
         }
-    };
+        res.ok()
+    });
 
     let mut frame = VideoFrame::empty();
     let mut converted_frame = VideoFrame::empty();
