@@ -2,7 +2,7 @@
 #![feature(new_uninit)]
 
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ffmpeg_the_third::format::{Pixel, Sample};
@@ -40,12 +40,11 @@ impl<T:Seek> Seek for BadReadWrapper<T> {
     }
 }
 
-struct StreamSink<T> {
+pub struct StreamSink<T> {
     stream_idx: usize,
     decoder: Decoder,
     processing_step: Option<(T, Box<dyn FnMut(&T, &mut T)>)>,
     output_queue: Arc<RingBuf<T>>,
-    audio_stream: Option<cpal::Stream>,
 }
 
 trait _OptionExt<T> {
@@ -114,7 +113,7 @@ pub enum AudioOutputError {
     BuildStreamError(#[from] cpal::BuildStreamError),
 }
 
-pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Parameters) -> Result<StreamSink<AudioFrame>, AudioOutputError> {
+pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Parameters) -> Result<(StreamSink<AudioFrame>, cpal::Stream), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
@@ -156,7 +155,7 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
         },
         // TODO handle the case where the audio driver can't accept this sample format.
         match audio_decoder.format() {
-            Sample::None => todo!(),
+            Sample::None => panic!("unknown sample format"),
             Sample::U8(_) => cpal::SampleFormat::U8,
             Sample::I16(_) => cpal::SampleFormat::I16,
             Sample::I32(_) => cpal::SampleFormat::I32,
@@ -170,7 +169,7 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
             }
         }, 
         move |error| {
-            eprintln!("audio decode error: {}", error);
+            eprintln!("audio playback error: {}", error);
             // errors here are usually non fatal, so we don't close the stream here.
         },
         Some(Duration::from_millis(200)), // arbitrarily chosen
@@ -182,37 +181,50 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
         let input_pts = ((input.pts().unwrap() * repacker.input().rate as i64) / 1000) * repacker.output().rate as i64;
         let next_pts = unsafe {ffmpeg::ffi::swr_next_pts(repacker.as_mut_ptr(), input_pts)};
         let next_pts = ((next_pts / repacker.output().rate as i64) * 1000) / repacker.input().rate as i64;
+
+        // if the `samples` field on the output frame is set to 0 when repacker.run() is invoked,
+        // ffmpeg will treat it as an output field, writing as many samples as it can into the
+        // buffer and returning how many samples it wrote in that same field.
+        // if it is not set to 0, ffmpeg will treat it as an input field and return at most that many samples.
+        // since we reuse the same Frame over and over to avoid thrashing the memory allocator, we
+        // must manually reset this field so that ffmpeg will set it again instead of erroneously
+        // interpreting its previous result as its next argument.
+        //
+        // C code sucks.
         output.set_samples(0); // ensure that ffmpeg will put the number of samples into this buffer, instead of treating it as an input.
         repacker.run(input, output).expect("resampler failed");
         output.set_pts(Some(next_pts));
     }));
 
-        // bizarre workaround for what i can only assume is a compiler bug
-        // TODO report this to the rustc team.
-        let func = processing_step.map(|a| {
-            let b: Box<dyn FnMut(&AudioFrame, &mut AudioFrame)+'static> = a;
-            b
-        });
+    // bizarre workaround for what i can only assume is a compiler bug
+    // TODO report this to the rustc team.
+    let func = processing_step.map(|a| {
+        let b: Box<dyn FnMut(&AudioFrame, &mut AudioFrame)+'static> = a;
+        b
+    });
 
-        let processing_step = func.map(|func| (AudioFrame::empty(), func));
+    let processing_step = func.map(|func| (AudioFrame::empty(), func));
 
-        Ok(StreamSink {
-            stream_idx,
-            decoder: audio_decoder.0,
-            processing_step,
-            output_queue: queue,
-            audio_stream: Some(stream),
-        })
+    Ok((StreamSink {
+        stream_idx,
+        decoder: audio_decoder.0,
+        processing_step,
+        output_queue: queue,
+    }, stream))
 
 
 }
 
 fn main() {
-    let f = std::fs::File::open("/home/vsparks/Videos/lagtrain.webm").unwrap();
+    let f = std::fs::File::open("/home/vsparks/Videos/most fashionable faction.webm").unwrap();
     //let data = std::fs::read("/home/vsparks/Videos/lagtrain.webm").unwrap();
     //let f = std::io::Cursor::new(data);
-    let mut cio = custom_io::CustomIO::new_read_nonseekable(f);
+    let mut cio = custom_io::CustomIO::new_read_seekable(f);
     let mut input = cio.open_input().unwrap();
+    video_decode_thread(&mut input);
+}
+
+fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
     unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
     println!("format name is {}", input.format().name());
     input::dump(&input, 0, Some("<custom stream>"));
@@ -227,7 +239,7 @@ fn main() {
 
     let audio_stream = input.streams().best(Type::Audio);
 
-    let mut audio_machinery: Option<StreamSink<AudioFrame>> = audio_stream.as_ref().and_then(|stream| {
+    let mut audio_machinery: Option<(StreamSink<AudioFrame>, cpal::Stream)> = audio_stream.as_ref().and_then(|stream| {
         let res = create_audio_output(stream.index(), stream.parameters());
         if let Err(e) = &res {
             eprintln!("unable to create audio output: {}.  playing video only.", e);
@@ -240,15 +252,33 @@ fn main() {
 
     let mut frames=0;
 
-    for packet in input.packets() {
-        let (stream, packet) = packet.expect("error reading packet");
-        if stream.index() == video_stream_idx {
+    let mut last_pts = 0;
+
+
+    let mut packet = ffmpeg::Packet::empty();
+    while {
+        match packet.read(&mut *input) {
+            Ok(()) => true,
+            Err(ffmpeg::Error::Eof) => false,
+            Err(e) => panic!("Error reading packet: {}", e),
+        }
+    } {
+        if packet.stream() == video_stream_idx {
             video_decoder.send_packet(&packet).expect("error decoding packet");
             loop {
                 match video_decoder.receive_frame(&mut frame) {
                     Ok(()) => {
+                        if let Some(pts) = frame.pts() {
+                            if pts < last_pts {
+                                println!("non-monotonic pts! last {} now {}", last_pts, pts);
+                            }
+                            last_pts = pts;
+                        } else {
+                            println!("video frame has no pts!");
+                        }
                         frames += 1;
-                        if frames < 100 {
+                        continue;
+                        if frames < 1000 {
                             continue;
                         }
                         scaler.run(&frame, &mut converted_frame).expect("error converting frame");
@@ -263,8 +293,8 @@ fn main() {
             }
         } else {
             let mut audio_stop=false;
-            if let Some(machinery) = &mut audio_machinery {
-                if stream.index() == machinery.stream_idx {
+            if let Some((machinery, _stream)) = &mut audio_machinery {
+                if packet.stream() == machinery.stream_idx {
                     machinery.decoder.send_packet(&packet).expect("error decoding packet");
                     loop {
                         let mut slot = match machinery.output_queue.write() {
