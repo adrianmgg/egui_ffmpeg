@@ -2,6 +2,8 @@
 #![feature(new_uninit)]
 
 use std::io::{Read, Seek};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,7 +43,6 @@ impl<T:Seek> Seek for BadReadWrapper<T> {
 }
 
 pub struct StreamSink<T> {
-    stream_idx: usize,
     decoder: Decoder,
     processing_step: Option<(T, Box<dyn FnMut(&T, &mut T)>)>,
     output_queue: Arc<RingBuf<T>>,
@@ -75,10 +76,14 @@ impl AudioPlayer {
         }
     }
 
-    fn output(&mut self, mut output_buffer: &mut [u8]) -> bool {
+    fn output(&mut self, mut output_buffer: &mut [u8]) -> (Option<i64>, bool) {
+        let mut pts = None;
         while !output_buffer.is_empty() {
             match self.queue.read() {
                 Ok(frame) => {
+                    if pts.is_none() {
+                        pts = frame.pts();
+                    }
                     let total_len = frame.samples() * self.bytes_per_sample;
                     let input_data = &frame.data(0)[self.offset_into_current_slot..total_len];
                     self.offset_into_current_slot=0;
@@ -86,18 +91,18 @@ impl AudioPlayer {
                         output_buffer.copy_from_slice(&input_data[..output_buffer.len()]);
                         self.offset_into_current_slot = output_buffer.len();
                         frame.do_not_consume();
-                        return false;
+                        return (pts, false);
                     }
                     output_buffer[..input_data.len()].copy_from_slice(input_data);
                     output_buffer = &mut output_buffer[input_data.len()..];
                 },
                 Err(_) => {
                     // TODO fill the rest of the sample with equilibrium data.
-                    return true;
+                    return (pts, true);
                 },
             }
         }
-        false
+        (pts, false)
     }
 }
 
@@ -111,9 +116,56 @@ pub enum AudioOutputError {
     NoAudioOutputDevice,
     #[error("error creating audio output stream")]
     BuildStreamError(#[from] cpal::BuildStreamError),
+    #[error("error starting audio output stream")]
+    PlayStreamError(#[from] cpal::PlayStreamError),
 }
 
-pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Parameters) -> Result<(StreamSink<AudioFrame>, cpal::Stream), AudioOutputError> {
+#[derive(Default)]
+pub struct AudioCallbackInfo {
+    current_pts: AtomicI64,
+    audio_eof: AtomicBool,
+}
+
+fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamSink<F>) -> Result<(), ffmpeg::Error> {
+    match &mut handler.processing_step {
+        Some((temp_frame, processing_step)) => {
+            loop {
+                // wait until the decode has completed into the temp_frame to lock the output queue,
+                // so the lock is only held during the processing step instead of the processing
+                // and decode steps.
+                // this should maybe possibly theoretically improve performance maybe.
+                // i'm honestly not sure if it will or not.  probably not measurably.  but it can't hurt.
+                match handler.decoder.receive_frame(temp_frame) {
+                    Ok(()) => {
+                        match handler.output_queue.write() {
+                            Ok(mut frame) => processing_step(&temp_frame, &mut frame),
+                            Err(_) => return Err(ffmpeg::Error::Eof),
+                        }
+                    },
+                    Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+        },
+        None => {
+            loop {
+                match handler.output_queue.write() {
+                    Ok(mut frame) => match handler.decoder.receive_frame(&mut frame) {
+                        Ok(()) => {},
+                        Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => {
+                            frame.do_not_consume();
+                            return Ok(())
+                        },
+                        Err(e) => return Err(e),
+                    },
+                    Err(ringbuf::AcquireError::ChannelClosed) => return Err(ffmpeg::Error::Eof),
+                }
+            }
+        },
+    }
+}
+
+pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(StreamSink<AudioFrame>, cpal::Stream, Arc<AudioCallbackInfo>), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
@@ -137,6 +189,8 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
 
 
     let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
+    let callback_info = Arc::new(AudioCallbackInfo::default());
+    let callback_info2 = callback_info.clone();
     let bytes_per_sample = match audio_decoder.format() {
         Sample::None => 0,
         Sample::U8(_) => 1,
@@ -164,9 +218,14 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
             Sample::F64(_) => cpal::SampleFormat::F64,
         },
         move |data, info| {
-            if queue_consumer.output(data.bytes_mut()) {
-                // todo shut down the stream
+            let (pts, done) = queue_consumer.output(data.bytes_mut());
+            if let Some(pts) = pts {
+                let ts = info.timestamp();
+                // TODO do this calculation properly
+                let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
+                callback_info2.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
             }
+            callback_info2.audio_eof.store(done, Ordering::Relaxed);
         }, 
         move |error| {
             eprintln!("audio playback error: {}", error);
@@ -174,7 +233,7 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
         },
         Some(Duration::from_millis(200)), // arbitrarily chosen
         )?;
-    stream.play().unwrap();
+    stream.play()?;
     println!("audio stream started");
     let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
         // operations are done in this order to reduce the probability of overflow while preserving as much precision as possible.
@@ -206,11 +265,10 @@ pub fn create_audio_output(stream_idx: usize, parameters: ffmpeg::codec::Paramet
     let processing_step = func.map(|func| (AudioFrame::empty(), func));
 
     Ok((StreamSink {
-        stream_idx,
         decoder: audio_decoder.0,
         processing_step,
         output_queue: queue,
-    }, stream))
+    }, stream, callback_info))
 
 
 }
@@ -219,9 +277,9 @@ fn main() {
     let f = std::fs::File::open("/home/vsparks/Videos/most fashionable faction.webm").unwrap();
     //let data = std::fs::read("/home/vsparks/Videos/lagtrain.webm").unwrap();
     //let f = std::io::Cursor::new(data);
-    let mut cio = custom_io::CustomIO::new_read_seekable(f);
-    let mut input = cio.open_input().unwrap();
-    video_decode_thread(&mut input);
+        let mut cio = custom_io::CustomIO::new_read_seekable(f);
+        let mut input = cio.open_input().unwrap();
+        video_decode_thread(&mut input);
 }
 
 fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
@@ -239,21 +297,20 @@ fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
 
     let audio_stream = input.streams().best(Type::Audio);
 
-    let mut audio_machinery: Option<(StreamSink<AudioFrame>, cpal::Stream)> = audio_stream.as_ref().and_then(|stream| {
-        let res = create_audio_output(stream.index(), stream.parameters());
+    let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>, cpal::Stream, Arc<AudioCallbackInfo>)> = audio_stream.as_ref().and_then(|stream| {
+        let res = create_audio_output(stream.parameters());
         if let Err(e) = &res {
             eprintln!("unable to create audio output: {}.  playing video only.", e);
         }
-        res.ok()
+        res.ok().map(|(streamsink, cpalstream, info)| (stream.index(), streamsink, cpalstream, info))
     });
 
     let mut frame = VideoFrame::empty();
     let mut converted_frame = VideoFrame::empty();
 
-    let mut frames=0;
-
     let mut last_pts = 0;
 
+    let mut frames=0;
 
     let mut packet = ffmpeg::Packet::empty();
     while {
@@ -293,41 +350,14 @@ fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
             }
         } else {
             let mut audio_stop=false;
-            if let Some((machinery, _stream)) = &mut audio_machinery {
-                if packet.stream() == machinery.stream_idx {
+            if let Some((audio_stream_idx, machinery, _stream, info)) = &mut audio_machinery {
+                println!("{}", info.current_pts.load(Ordering::Relaxed));
+                if packet.stream() == *audio_stream_idx {
                     machinery.decoder.send_packet(&packet).expect("error decoding packet");
-                    loop {
-                        let mut slot = match machinery.output_queue.write() {
-                            Ok(x) => x,
-                            Err(_) => {
-                                audio_stop=true;
-                                break;
-                            },
-                        };
-                        let res = if let Some((frame, _)) = &mut machinery.processing_step {
-                            machinery.decoder.receive_frame(frame)
-                        } else {
-                            machinery.decoder.receive_frame(&mut *slot)
-                        };
-                        match res {
-                            Ok(()) => {
-                                if let Some((frame, process)) = &mut machinery.processing_step {
-                                    process(frame, &mut *slot);
-                                }
-                            },
-                            Err(ffmpeg::Error::Eof) => {
-                                machinery.output_queue.close_write();
-                                audio_stop=true;
-                            },
-                            Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => {
-                                slot.do_not_consume();
-                                break;
-                            },
-                            Err(e) => {
-                                machinery.output_queue.close_write();
-                                panic!("error decoding audio: {}", e);
-                            },
-                        }
+                    match pump_decoder(machinery) {
+                        Ok(()) => {},
+                        Err(ffmpeg::Error::Eof) => {audio_stop=true;},
+                        Err(e) => panic!("error decoding audio: {}", e),
                     }
                 }
             }
