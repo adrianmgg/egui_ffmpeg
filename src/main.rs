@@ -121,7 +121,8 @@ pub enum AudioOutputError {
 }
 
 #[derive(Default)]
-pub struct AudioCallbackInfo {
+pub struct SynchronizationInfo {
+    audio_major: AtomicBool,
     current_pts: AtomicI64,
     audio_eof: AtomicBool,
 }
@@ -133,6 +134,7 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
                 // wait until the decode has completed into the temp_frame to lock the output queue,
                 // so the lock is only held during the processing step instead of the processing
                 // and decode steps.
+                // it also means we never call frame.do_not_consume().
                 // this should maybe possibly theoretically improve performance maybe.
                 // i'm honestly not sure if it will or not.  probably not measurably.  but it can't hurt.
                 match handler.decoder.receive_frame(temp_frame) {
@@ -147,7 +149,7 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
                 }
             }
         },
-        None => {
+        Option::None => {
             loop {
                 match handler.output_queue.write() {
                     Ok(mut frame) => match handler.decoder.receive_frame(&mut frame) {
@@ -165,7 +167,7 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
     }
 }
 
-pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(StreamSink<AudioFrame>, cpal::Stream, Arc<AudioCallbackInfo>), AudioOutputError> {
+pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronization_info: Arc<SynchronizationInfo>) -> Result<(StreamSink<AudioFrame>, cpal::Stream), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
@@ -174,7 +176,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(Str
 
     use ffmpeg::util::format::sample::Type;
     let sample_repack_to = match audio_decoder.format() {
-        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)), 
+        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)),
         Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
         Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
         Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
@@ -189,8 +191,6 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(Str
 
 
     let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
-    let callback_info = Arc::new(AudioCallbackInfo::default());
-    let callback_info2 = callback_info.clone();
     let bytes_per_sample = match audio_decoder.format() {
         Sample::None => 0,
         Sample::U8(_) => 1,
@@ -223,9 +223,9 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(Str
                 let ts = info.timestamp();
                 // TODO do this calculation properly
                 let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
-                callback_info2.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
+                synchronization_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
             }
-            callback_info2.audio_eof.store(done, Ordering::Relaxed);
+            synchronization_info.audio_eof.store(done, Ordering::Relaxed);
         }, 
         move |error| {
             eprintln!("audio playback error: {}", error);
@@ -268,7 +268,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters) -> Result<(Str
         decoder: audio_decoder.0,
         processing_step,
         output_queue: queue,
-    }, stream, callback_info))
+    }, stream))
 
 
 }
@@ -297,12 +297,17 @@ fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
 
     let audio_stream = input.streams().best(Type::Audio);
 
-    let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>, cpal::Stream, Arc<AudioCallbackInfo>)> = audio_stream.as_ref().and_then(|stream| {
-        let res = create_audio_output(stream.parameters());
+    let synchronization_info: Arc<SynchronizationInfo> = Default::default();
+
+    let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>, cpal::Stream)> = audio_stream.as_ref().and_then(|stream| {
+        let res = create_audio_output(stream.parameters(), synchronization_info.clone());
         if let Err(e) = &res {
             eprintln!("unable to create audio output: {}.  playing video only.", e);
         }
-        res.ok().map(|(streamsink, cpalstream, info)| (stream.index(), streamsink, cpalstream, info))
+        if res.is_ok() {
+            synchronization_info.audio_major.store(true,Ordering::Relaxed);
+        }
+        res.ok().map(|(streamsink, cpalstream)| (stream.index(), streamsink, cpalstream))
     });
 
     let mut frame = VideoFrame::empty();
@@ -320,6 +325,7 @@ fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
             Err(e) => panic!("Error reading packet: {}", e),
         }
     } {
+        println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
         if packet.stream() == video_stream_idx {
             video_decoder.send_packet(&packet).expect("error decoding packet");
             loop {
@@ -350,8 +356,7 @@ fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
             }
         } else {
             let mut audio_stop=false;
-            if let Some((audio_stream_idx, machinery, _stream, info)) = &mut audio_machinery {
-                println!("{}", info.current_pts.load(Ordering::Relaxed));
+            if let Some((audio_stream_idx, machinery, _stream)) = &mut audio_machinery {
                 if packet.stream() == *audio_stream_idx {
                     machinery.decoder.send_packet(&packet).expect("error decoding packet");
                     match pump_decoder(machinery) {
