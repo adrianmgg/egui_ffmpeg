@@ -3,10 +3,18 @@ name = "ffmpeg-player"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type=["lib"]
+
 [dependencies]
 bytemuck = "1.16.1"
 cpal = "0.15.3"
+eframe = "0.28.1"
+egui = "0.28.1"
 #eframe = { version = "0.28.1", default-features = false, features = ["wayland", "wgpu", "default_fonts"] }
 #egui = "0.28.1"
 ffmpeg-the-third = { version = "2.0.1", features = ["build"] }#, path="ffmpeg-the-third"}
 image = { version = "0.25.1", default-features = false, features = ["png"] }
+oneshot = "0.1.8"
+replace_with = "0.1.7"
+thiserror = "1.0.63"

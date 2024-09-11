@@ -275,22 +275,8 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
 
 }
 
-fn main() {
-    let f = std::fs::File::open("/home/vsparks/Videos/most fashionable faction.webm").unwrap();
-    //let data = std::fs::read("/home/vsparks/Videos/lagtrain.webm").unwrap();
-    //let f = std::io::Cursor::new(data);
-    std::thread::spawn(|| {
-        let mut cio = ffmpeg_player::CustomIO::new_read_seekable(f);
-        let mut input = cio.open_input().unwrap();
-        ffmpeg_player::video_decode_thread(&mut input);
-    });
-
-    
-}
-
-
 // TODO don't make this a public API please GOD do not make this a public API
-pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
+pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, synchronization_info: Arc<SynchronizationInfo>, video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>) {
     unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
     println!("format name is {}", input.format().name());
     input::dump(&input, 0, Some("<custom stream>"));
@@ -307,10 +293,9 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
         processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| scaler.run(frame_in, frame_out).expect("scaler failed")))),
         output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty())),
     };
+    let _ = video_sender.send(video_machinery.output_queue.clone());
 
     let audio_stream = input.streams().best(Type::Audio);
-
-    let synchronization_info: Arc<SynchronizationInfo> = Default::default();
 
     let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>, cpal::Stream)> = audio_stream.as_ref().and_then(|stream| {
         let res = create_audio_output(stream.parameters(), synchronization_info.clone());
@@ -325,13 +310,12 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
 
 
     let mut packet = ffmpeg::Packet::empty();
-    while {
+    loop {
         match packet.read(&mut *input) {
-            Ok(()) => true,
-            Err(ffmpeg::Error::Eof) => false,
+            Ok(()) => {},
+            Err(ffmpeg::Error::Eof) => break,
             Err(e) => panic!("Error reading packet: {}", e),
         }
-    } {
         println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
         if packet.stream() == video_stream_idx {
             video_machinery.decoder.send_packet(&packet).expect("error decoding packet");
@@ -353,4 +337,5 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input) {
             }
         }
     }
+    video_machinery.decoder.send_eof().expect("error sending eof");
 }
