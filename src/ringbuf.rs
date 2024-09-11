@@ -39,7 +39,7 @@ pub struct RingBufSlot<'a, T, const Writable: bool> {
     guard: RingBufGuard<'a, T>,
     pub slot: usize,
     caused_wrap: bool,
-    condvar: Option<&'a Condvar>,
+    condvar: &'a Condvar,
 }
 
 impl<'a, T, const Writable: bool> Deref for RingBufSlot<'a, T, Writable> {
@@ -75,9 +75,7 @@ impl<'a, T> RingBufSlot<'a, T,true> {
 
 impl<'a, T, const WRITE: bool> Drop for RingBufSlot<'a,T,WRITE> {
     fn drop(&mut self) {
-        if let Some(condvar) = self.condvar {
-            condvar.notify_one();
-        }
+        self.condvar.notify_one();
     }
 }
 
@@ -101,11 +99,11 @@ impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
                 self.guard.writer_wrapped=true;
             }
         }
-        self.condvar=None;
+        std::mem::forget(self); // prevent the destructor being run (and thus the condvar notified)
     }
 }
 
-fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>) -> Result<RingBufSlot<'a, T, WRITE>, RingBufGuard<'a, T>> {
+fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>, condvar: &'a Condvar) -> Result<RingBufSlot<'a, T, WRITE>, RingBufGuard<'a, T>> {
     let can_advance = guard.read_offset != guard.write_offset || (WRITE ^ guard.writer_wrapped);
     if can_advance {
         let mut caused_wrap=false;
@@ -128,7 +126,7 @@ fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>) -> Res
             }
             slot
         };
-        Ok(RingBufSlot{guard, slot, caused_wrap, condvar:None})
+        Ok(RingBufSlot{guard, slot, caused_wrap, condvar})
     } else {
         Err(guard)
     }
@@ -165,16 +163,13 @@ impl<T> RingBuf<T> {
     pub fn read(&self) -> Result<RingBufSlot<'_,T,false>,AcquireError> {
         let mut guard = self.inner.lock().unwrap();
         loop {
-            guard = match try_get_slot::<T, false>(guard) {
-                Ok(mut res) => {
-                    res.condvar = Some(&self.write_ready);
-                    return Ok(res)
-                },
+            guard = match try_get_slot::<T, false>(guard, &self.write_ready) {
+                Ok(res) => return Ok(res),
                 Err(guard) => {
                     if guard.writer_closed {
                         return Err(AcquireError::ChannelClosed);
                     } else {
-                        eprintln!("queue underrun");
+                        //eprintln!("queue underrun");
                         self.read_ready.wait(guard).unwrap()
                     }
                 },
@@ -185,13 +180,10 @@ impl<T> RingBuf<T> {
     pub fn try_read(&self) -> Result<RingBufSlot<'_,T,false>,TryAcquireError> {
         let guard = self.inner.lock().unwrap();
 
-        let r = try_get_slot::<T, false>(guard).map_err(|guard| 
-            if guard.writer_closed {TryAcquireError::ChannelClosed} else {TryAcquireError::NotReady}
-            );
-        r.map(|mut x| {
-            x.condvar = Some(&self.write_ready);
-            x
-            })
+        try_get_slot::<T, false>(guard, &self.write_ready)
+            .map_err(|guard| 
+                if guard.writer_closed {TryAcquireError::ChannelClosed} else {TryAcquireError::NotReady}
+            )
     }
 
     pub fn write(&self) -> Result<RingBufSlot<'_,T,true>,AcquireError> {
@@ -200,13 +192,10 @@ impl<T> RingBuf<T> {
             if guard.reader_closed {
                 return Err(AcquireError::ChannelClosed);
             }
-            guard = match try_get_slot::<T, true>(guard) {
-                Ok(mut res) => {
-                    res.condvar = Some(&self.read_ready);
-                    return Ok(res)
-                },
+            guard = match try_get_slot::<T, true>(guard, &self.read_ready) {
+                Ok(res) => return Ok(res),
                 Err(guard) => {
-                    eprintln!("queue overrun");
+                    //eprintln!("queue overrun");
                     self.write_ready.wait(guard).unwrap()
                 },
             }
@@ -219,11 +208,7 @@ impl<T> RingBuf<T> {
             return Err(TryAcquireError::ChannelClosed);
         }
 
-        let r = try_get_slot(guard).map_err(|_| TryAcquireError::NotReady);
-        r.map(|mut x| {
-            x.condvar = Some(&self.read_ready);
-            x
-        })
+        try_get_slot::<T, true>(guard, &self.read_ready).map_err(|_| TryAcquireError::NotReady)
     }
 
     pub fn close_read(&self) {
