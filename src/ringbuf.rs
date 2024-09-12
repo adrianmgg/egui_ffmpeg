@@ -75,6 +75,7 @@ impl<'a, T> RingBufSlot<'a, T,true> {
 
 impl<'a, T, const WRITE: bool> Drop for RingBufSlot<'a,T,WRITE> {
     fn drop(&mut self) {
+        eprintln!("notifying");
         self.condvar.notify_one();
     }
 }
@@ -99,7 +100,10 @@ impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
                 self.guard.writer_wrapped=true;
             }
         }
-        std::mem::forget(self); // prevent the destructor being run (and thus the condvar notified)
+        // run drop code for self.guard, but not for self.
+        // SAFETY: self is never used again.
+        unsafe {std::ptr::drop_in_place(&mut self.guard)};
+        std::mem::forget(self);
     }
 }
 
@@ -169,7 +173,7 @@ impl<T> RingBuf<T> {
                     if guard.writer_closed {
                         return Err(AcquireError::ChannelClosed);
                     } else {
-                        //eprintln!("queue underrun");
+                        eprintln!("queue underrun");
                         self.read_ready.wait(guard).unwrap()
                     }
                 },
@@ -195,7 +199,7 @@ impl<T> RingBuf<T> {
             guard = match try_get_slot::<T, true>(guard, &self.read_ready) {
                 Ok(res) => return Ok(res),
                 Err(guard) => {
-                    //eprintln!("queue overrun");
+                    eprintln!("queue overrun");
                     self.write_ready.wait(guard).unwrap()
                 },
             }
