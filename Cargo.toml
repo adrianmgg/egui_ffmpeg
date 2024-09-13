@@ -16,5 +16,6 @@ egui = "0.28.1"
 ffmpeg-the-third = { version = "2.0.1", features = ["build"] }#, path="ffmpeg-the-third"}
 image = { version = "0.25.1", default-features = false, features = ["png"] }
 oneshot = "0.1.8"
+pending = { version = "1.0", git = "https://github.com/vincent-sparks/pending" } # TODO put pending on crates
 replace_with = "0.1.7"
 thiserror = "1.0.63"
