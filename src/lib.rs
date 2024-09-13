@@ -88,13 +88,15 @@ struct AudioPlayer {
     offset_into_current_slot: usize,
     bytes_per_sample: usize,
     equilibrium: &'static [u8],
+    sample_rate: u32,
 }
 
 impl AudioPlayer {
-    fn new(queue: Arc<RingBuf<AudioFrame>>, bytes_per_sample: usize, equilibrium: &'static [u8]) -> Self {
+    fn new(queue: Arc<RingBuf<AudioFrame>>, sample_rate: u32, bytes_per_sample: usize, equilibrium: &'static [u8]) -> Self {
         Self {
             queue,
             offset_into_current_slot: 0,
+            sample_rate,
             bytes_per_sample,
             equilibrium,
         }
@@ -107,6 +109,13 @@ impl AudioPlayer {
                 Ok(frame) => {
                     if pts.is_none() {
                         pts = frame.pts();
+                        if let Some(ref mut pts) = pts {
+                            if self.offset_into_current_slot != 0 {
+                                let samples_into_current_slot =self.offset_into_current_slot / self.bytes_per_sample;
+                                let millis_into_current_slot = (samples_into_current_slot as i64) * 1000 / self.sample_rate as i64;
+                                *pts += millis_into_current_slot;
+                            }
+                        }
                     }
                     let total_len = frame.samples() * self.bytes_per_sample;
                     let input_data = &frame.data(0)[self.offset_into_current_slot..total_len];
@@ -235,6 +244,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
             Sample::F64(_) => cpal::SampleFormat::F64,
     };
     let mut queue_consumer = AudioPlayer::new(queue.clone(),
+        audio_decoder.rate(),
         bytes_per_sample * audio_decoder.ch_layout().channels() as usize,
         dbg!(equilibrium(format)));
     let stream = device.build_output_stream_raw(
@@ -324,7 +334,10 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
         let mut scaler = video_decoder.converter(Pixel::RGBA).expect("unable to create color converter");
         let video_machinery = StreamSink {
             decoder: video_decoder.0,
-            processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| scaler.run(frame_in, frame_out).expect("scaler failed")))),
+            processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| {
+                scaler.run(frame_in, frame_out).expect("scaler failed");
+                frame_out.set_pts(frame_in.pts());
+            }))),
             output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty())),
         };
         let _ = video_sender.send(video_machinery.output_queue.clone());
@@ -352,7 +365,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
             Err(ffmpeg::Error::Eof) => break,
             Err(e) => panic!("Error reading packet: {}", e),
         }
-        println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
+        //println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
         if let Some((video_stream_idx, ref mut machinery)) = video_machinery {
             if packet.stream() == video_stream_idx {
                 machinery.decoder.send_packet(&packet).expect("error decoding packet");

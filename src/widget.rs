@@ -53,7 +53,20 @@ impl egui::Widget for &mut VideoPlayerWidget {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             self.draw_playback_controls(ui);
             if let Some(video) = self.video_queue.try_load() {
-                if let Ok(frame) = video.read() {
+                let current_pts = self.synchronization_info.current_pts.load(Ordering::Relaxed);
+                let mut iter = video.read_iter();
+
+                while let Some(frame) = iter.next() {
+                    dbg!(frame.pts());
+                    if !frame.pts().is_some_and(|pts| pts <= current_pts) {
+                        iter.back();
+                        break;
+                    }
+                }
+                iter.back();
+                let slot = iter.mark();
+                
+                if let Some(frame) = slot {
                     let pixels = frame.data(0)
                         .array_chunks::<4>()
                         .copied()

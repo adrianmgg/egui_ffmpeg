@@ -113,10 +113,23 @@ enum WrapState {
     HasWrapped,
 }
 
+pub struct NonNotifyingSlot<'a,T> {
+    guard: RingBufGuard<'a, T>,
+    pub slot: usize,
+}
+
+impl<'a,T> Deref for NonNotifyingSlot<'a,T> {
+    type Target=T;
+    fn deref(&self) -> &T {
+        &self.guard.buffer[self.slot]
+    }
+}
+
 pub struct ReadIterator<'a, T> {
     guard: RingBufGuard<'a, T>,
     cursor: usize,
     wrap_state: WrapState,
+    condvar: &'a Condvar,
 }
 
 impl<'a, T> ReadIterator<'a, T> {
@@ -145,6 +158,18 @@ impl<'a, T> ReadIterator<'a, T> {
             self.cursor -= 1;
         }
         true
+    }
+
+    pub fn mark(mut self) -> Option<NonNotifyingSlot<'a,T>> {
+        if self.guard.read_offset != self.cursor {
+            self.condvar.notify_one();
+        }
+        self.guard.read_offset = self.cursor;
+        self.guard.writer_wrapped = matches!(self.wrap_state, WrapState::MayWrap);
+        if self.cursor == self.guard.write_offset && !matches!(self.wrap_state, WrapState::MayWrap) {
+            return None;
+        }
+        Some(NonNotifyingSlot {guard: self.guard, slot: self.cursor})
     }
 }
 
@@ -238,6 +263,7 @@ impl<T> RingBuf<T> {
             wrap_state: if guard.writer_wrapped {WrapState::MayWrap} else {WrapState::MayNotWrap},
             cursor: guard.read_offset,
             guard,
+            condvar: &self.write_ready,
         }
     }
 
