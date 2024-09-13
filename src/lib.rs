@@ -22,26 +22,45 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait as _};
 pub mod ringbuf;
 use ringbuf::RingBuf;
 
-#[allow(dead_code)]
-struct BadReadWrapper<T>(T);
+pub mod widget;
 
-impl<T> Read for BadReadWrapper<T> where T: Read {
-    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
-        let l = buf.len();
-        if l > 50 {
-            buf = &mut buf[..50];
-        }
-        self.0.read(buf)
+fn equilibrium(format: cpal::SampleFormat) -> &'static [u8] {
+    match format {
+        cpal::SampleFormat::I8 => bytemuck::bytes_of(&<i8 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::I16 => bytemuck::bytes_of(&<i16 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::I32 => bytemuck::bytes_of(&<i32 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::I64 => bytemuck::bytes_of(&<i64 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::U8 => bytemuck::bytes_of(&<u8 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::U16 => bytemuck::bytes_of(&<u16 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::U32 => bytemuck::bytes_of(&<u32 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::U64 => bytemuck::bytes_of(&<u64 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::F32 => bytemuck::bytes_of(&<f32 as cpal::Sample>::EQUILIBRIUM),
+        cpal::SampleFormat::F64 => bytemuck::bytes_of(&<f64 as cpal::Sample>::EQUILIBRIUM),
+        _ => todo!(),
     }
 }
 
-impl<T:Seek> Seek for BadReadWrapper<T> {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.0.seek(pos)
+fn repeat_to_fill(input: &[u8], output: &mut [u8]) {
+    assert!(output.len() % input.len() == 0);
+    // this algorithm is borrowed from std::Vec::repeat()
+    // first, we copy our input into the first bit of the output
+    output[..input.len()].copy_from_slice(input);
+    let mut filled = input.len();
+    // second, we repeatedly double how much of the output is filled with our repetitions by
+    // copying what we've already copied to the output to the next part of the output (2..4 gets
+    // copied from 0..2, 4..8 gets copied from 0..4, 8..16 gets copied from 0..8, etc.)
+    while filled < output.len() / 2 {
+        let (head, tail) = output.split_at_mut(filled);
+        tail[..filled].copy_from_slice(head);
+        filled *= 2;
     }
-    fn stream_len(&mut self) -> std::io::Result<u64> {
-        self.0.stream_len()
-    }
+    // finally, just in case the output length isn't a power of two, we copy the first part of the
+    // input to the last remaining bit of the output (i.e. 16..20 gets copied from 0..4)
+    // note that since we are guaranteed by the loop condition to be at least halfway through the
+    // slice, we only have to do this once.
+    let remainder = output.len() - filled;
+    let (head, tail) = output.split_at_mut(filled);
+    tail.copy_from_slice(&head[..remainder]);
 }
 
 pub struct StreamSink<T> {
@@ -67,14 +86,16 @@ struct AudioPlayer {
     queue: Arc<RingBuf<AudioFrame>>,
     offset_into_current_slot: usize,
     bytes_per_sample: usize,
+    equilibrium: &'static [u8],
 }
 
 impl AudioPlayer {
-    fn new(queue: Arc<RingBuf<AudioFrame>>, bytes_per_sample: usize) -> Self {
+    fn new(queue: Arc<RingBuf<AudioFrame>>, bytes_per_sample: usize, equilibrium: &'static [u8]) -> Self {
         Self {
             queue,
             offset_into_current_slot: 0,
             bytes_per_sample,
+            equilibrium,
         }
     }
 
@@ -99,7 +120,7 @@ impl AudioPlayer {
                     output_buffer = &mut output_buffer[input_data.len()..];
                 },
                 Err(_) => {
-                    // TODO fill the rest of the sample with equilibrium data.
+                    repeat_to_fill(self.equilibrium, output_buffer);
                     return (pts, true);
                 },
             }
@@ -124,6 +145,7 @@ pub enum AudioOutputError {
 
 #[derive(Default)]
 pub struct SynchronizationInfo {
+    is_playing: AtomicBool,
     audio_major: AtomicBool,
     current_pts: AtomicI64,
     audio_eof: AtomicBool,
@@ -202,15 +224,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
         Sample::F32(_) => 4,
         Sample::F64(_) => 8,
     };
-    let mut queue_consumer = AudioPlayer::new(queue.clone(), bytes_per_sample * audio_decoder.ch_layout().channels() as usize);
-    let stream = device.build_output_stream_raw(
-        &cpal::StreamConfig {
-            channels: audio_decoder.ch_layout().channels() as u16,
-            sample_rate: cpal::SampleRate(audio_decoder.rate()),
-            buffer_size: cpal::BufferSize::Default,
-        },
-        // TODO handle the case where the audio driver can't accept this sample format.
-        match audio_decoder.format() {
+    let format = match audio_decoder.format() {
             Sample::None => panic!("unknown sample format"),
             Sample::U8(_) => cpal::SampleFormat::U8,
             Sample::I16(_) => cpal::SampleFormat::I16,
@@ -218,16 +232,31 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
             Sample::I64(_) => cpal::SampleFormat::I64,
             Sample::F32(_) => cpal::SampleFormat::F32,
             Sample::F64(_) => cpal::SampleFormat::F64,
+    };
+    let mut queue_consumer = AudioPlayer::new(queue.clone(),
+        bytes_per_sample * audio_decoder.ch_layout().channels() as usize,
+        dbg!(equilibrium(format)));
+    let stream = device.build_output_stream_raw(
+        &cpal::StreamConfig {
+            channels: audio_decoder.ch_layout().channels() as u16,
+            sample_rate: cpal::SampleRate(audio_decoder.rate()),
+            buffer_size: cpal::BufferSize::Default,
         },
+        // TODO handle the case where the audio driver can't accept this sample format.
+        format,
         move |data, info| {
-            let (pts, done) = queue_consumer.output(data.bytes_mut());
-            if let Some(pts) = pts {
-                let ts = info.timestamp();
-                // TODO do this calculation properly
-                let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
-                synchronization_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
+            if synchronization_info.is_playing.load(Ordering::Relaxed) {
+                let (pts, done) = queue_consumer.output(data.bytes_mut());
+                if let Some(pts) = pts {
+                    let ts = info.timestamp();
+                    // TODO do this calculation properly
+                    let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
+                    synchronization_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
+                }
+                synchronization_info.audio_eof.store(done, Ordering::Relaxed);
+            } else {
+                repeat_to_fill(queue_consumer.equilibrium, data.bytes_mut());
             }
-            synchronization_info.audio_eof.store(done, Ordering::Relaxed);
         }, 
         move |error| {
             eprintln!("audio playback error: {}", error);
@@ -275,25 +304,31 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
 
 }
 
+pub struct DecodeThreadArgs {pub synchronization_info: Arc<SynchronizationInfo>, pub video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>
+}
+
 // TODO don't make this a public API please GOD do not make this a public API
-pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, synchronization_info: Arc<SynchronizationInfo>, video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>) {
-    unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
+pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: DecodeThreadArgs) {
+    //unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
     println!("format name is {}", input.format().name());
     input::dump(&input, 0, Some("<custom stream>"));
 
-    let video_stream = input.streams()
+    let DecodeThreadArgs {synchronization_info, video_sender} = args;
+
+    let mut video_machinery = input.streams()
         .best(Type::Video)
-        .expect("file contains no video stream for us to screenshot");
-    let video_stream_idx = video_stream.index();
-    let video_ctx = ffmpeg::codec::Context::from_parameters(video_stream.parameters()).expect("unable to create video context");
-    let video_decoder = video_ctx.decoder().video().expect("unable to create video decoder");
-    let mut scaler = video_decoder.converter(Pixel::RGBA).expect("unable to create color converter");
-    let mut video_machinery = StreamSink {
-        decoder: video_decoder.0,
-        processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| scaler.run(frame_in, frame_out).expect("scaler failed")))),
-        output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty())),
-    };
-    let _ = video_sender.send(video_machinery.output_queue.clone());
+        .map(|video_stream| {
+        let video_ctx = ffmpeg::codec::Context::from_parameters(video_stream.parameters()).expect("unable to create video context");
+        let video_decoder = video_ctx.decoder().video().expect("unable to create video decoder");
+        let mut scaler = video_decoder.converter(Pixel::RGBA).expect("unable to create color converter");
+        let video_machinery = StreamSink {
+            decoder: video_decoder.0,
+            processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| scaler.run(frame_in, frame_out).expect("scaler failed")))),
+            output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty())),
+        };
+        let _ = video_sender.send(video_machinery.output_queue.clone());
+        (video_stream.index(), video_machinery)
+        });
 
     let audio_stream = input.streams().best(Type::Audio);
 
@@ -317,25 +352,34 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, synchroni
             Err(e) => panic!("Error reading packet: {}", e),
         }
         println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
-        if packet.stream() == video_stream_idx {
-            video_machinery.decoder.send_packet(&packet).expect("error decoding packet");
-            pump_decoder(&mut video_machinery).expect("error decoding video");
-        } else {
-            let mut audio_stop=false;
-            if let Some((audio_stream_idx, machinery, _stream)) = &mut audio_machinery {
-                if packet.stream() == *audio_stream_idx {
-                    machinery.decoder.send_packet(&packet).expect("error decoding packet");
-                    match pump_decoder(machinery) {
-                        Ok(()) => {},
-                        Err(ffmpeg::Error::Eof) => {audio_stop=true;},
-                        Err(e) => panic!("error decoding audio: {}", e),
-                    }
+        if let Some((video_stream_idx, ref mut machinery)) = video_machinery {
+            if packet.stream() == video_stream_idx {
+                machinery.decoder.send_packet(&packet).expect("error decoding packet");
+                pump_decoder(machinery).expect("error decoding video");
+            } 
+        }
+        let mut audio_stop=false;
+        if let Some((audio_stream_idx, machinery, _stream)) = &mut audio_machinery {
+            if packet.stream() == *audio_stream_idx {
+                machinery.decoder.send_packet(&packet).expect("error decoding packet");
+                match pump_decoder(machinery) {
+                    Ok(()) => {},
+                    Err(ffmpeg::Error::Eof) => {audio_stop=true;},
+                    Err(e) => panic!("error decoding audio: {}", e),
                 }
             }
-            if audio_stop {
-                audio_machinery = None;
-            }
         }
+        if audio_stop {
+            audio_machinery = None;
+        }
+
     }
-    video_machinery.decoder.send_eof().expect("error sending eof");
+    if let Some((_, ref mut machinery, _)) = audio_machinery {
+        machinery.decoder.send_eof().unwrap();
+        let _ = pump_decoder(machinery);
+    }
+    if let Some((_, ref mut machinery)) = video_machinery {
+        machinery.decoder.send_eof().unwrap();
+        let _ = pump_decoder(machinery);
+    }
 }
