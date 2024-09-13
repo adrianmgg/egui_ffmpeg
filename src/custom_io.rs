@@ -45,6 +45,7 @@ impl<T> CustomIO<T> {
     custom_io_new!(new_rw_seekable, {Read+Write+Seek}, 1, Some(callback_native_read::<T>), Some(callback_native_write::<T>), Some(callback_native_seek::<T>));
     custom_io_new!(new_rw_nonseekable, {Read+Write}, 1, Some(callback_native_read::<T>), Some(callback_native_write::<T>), None);
 
+    /// SAFETY: self must never be referenced again, even by the drop code.
     unsafe fn _destroy(&mut self) -> Box<T> {
         let ptr = (*self.avio_ctx).opaque as *mut T;
         av_freep(addr_of!((*self.avio_ctx).buffer) as *mut c_void);
@@ -61,11 +62,19 @@ impl<T> CustomIO<T> {
         res
     }
 
+    pub fn as_ref(&self) -> &T {
+        unsafe {&*((*self.avio_ctx).opaque as *const T)}
+    }
+
+    pub fn as_mut(&mut self) -> &mut T {
+        unsafe {&mut *((*self.avio_ctx).opaque as *mut T)}
+    }
+
     pub fn open_input(&mut self) -> Result<Input<'_>, Error> {
         unsafe {Input::new(&mut *self.avio_ctx)}
     }
 
-    pub unsafe fn as_mut_ptr(&mut self) -> *mut AVIOContext {
+    pub fn as_mut_ptr(&mut self) -> *mut AVIOContext {
         self.avio_ctx
     }
 }
@@ -95,8 +104,6 @@ impl<'a> Input<'a> {
                 avformat_close_input(&mut ptr);
                 return Err(Error::from(r));
             }
-
-            println!("find_stream_info() success");
 
             // FFInput's drop implementation will call avformat_close_input() correctly as it
             // should.
@@ -155,7 +162,7 @@ unsafe extern "C" fn callback_native_read<T: Read>(state: *mut c_void, buf: *mut
     let state = state as *mut T;
     let state = &mut *state;
     let res= state.read(buf);
-    println!("ffmpeg asked us to read {} bytes -- our response was {:?}", buf.len(), res);
+    //println!("ffmpeg asked us to read {} bytes -- our response was {:?}", buf.len(), res);
     match res {
         Ok(0) => ffmpeg_the_third::ffi::AVERROR_EOF,
         Ok(count) => count.try_into().unwrap(),
