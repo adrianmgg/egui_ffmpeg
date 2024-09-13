@@ -17,6 +17,7 @@ impl VideoPlayerWidget {
     pub fn new(input_create: impl FnOnce(DecodeThreadArgs) + Send + 'static) -> Self {
         let (video_sender, video_receiver) = Pending::new();
         let synchronization_info: Arc<SynchronizationInfo> = Default::default();
+        synchronization_info.is_playing.store(true, Ordering::Relaxed);
         let sync_info2 = synchronization_info.clone();
         std::thread::spawn(move || input_create(DecodeThreadArgs{synchronization_info, video_sender}));
 
@@ -33,6 +34,7 @@ impl VideoPlayerWidget {
     fn draw_playback_controls(&mut self, ui: &mut egui::Ui) {
         let (play_button_resp, play_button_painter) = ui.allocate_painter(Vec2::new(20.0,20.0), Sense::click());
         let is_playing = if play_button_resp.clicked() {
+            println!("pause clicked");
             self.synchronization_info.is_playing.fetch_not(Ordering::AcqRel)
         } else {
             self.synchronization_info.is_playing.load(Ordering::Relaxed)
@@ -69,6 +71,7 @@ impl egui::Widget for &mut VideoPlayerWidget {
                     }
                     ui.add(egui::Image::new(SizedTexture::from_handle(self.texture.as_ref().unwrap()))
                         .maintain_aspect_ratio(true)
+                        .shrink_to_fit()
                     );
                 } else {
                     // if we get here, video is at eof
@@ -77,6 +80,8 @@ impl egui::Widget for &mut VideoPlayerWidget {
                 // if we get here, video is still loading
                 
             }
+            ui.ctx().request_repaint(); // TODO only schedule the redraw for the next frametime
+                                        // (most monitors run much higher than the video framerate)
         }).response
     }
 }
