@@ -106,6 +106,49 @@ impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
     }
 }
 
+#[derive(Debug)]
+enum WrapState {
+    MayNotWrap,
+    MayWrap,
+    HasWrapped,
+}
+
+pub struct ReadIterator<'a, T> {
+    guard: RingBufGuard<'a, T>,
+    cursor: usize,
+    wrap_state: WrapState,
+}
+
+impl<'a, T> ReadIterator<'a, T> {
+    pub fn next(&mut self) -> Option<&T> {
+        if self.cursor == self.guard.write_offset && !matches!(self.wrap_state, WrapState::MayWrap) {
+            return None;
+        }
+        let res = &self.guard.buffer[self.cursor];
+        self.cursor += 1;
+        if self.cursor >= self.guard.buffer.len() {
+            debug_assert!(matches!(self.wrap_state, WrapState::MayWrap), "{:?}", self.wrap_state);
+            self.wrap_state = WrapState::HasWrapped;
+            self.cursor = 0;
+        }
+        Some(res)
+    }
+    pub fn back(&mut self) -> bool {
+        if self.cursor == self.guard.read_offset && !matches!(self.wrap_state, WrapState::HasWrapped) {
+            return false;
+        }
+        if self.cursor == 0 {
+            debug_assert!(matches!(self.wrap_state, WrapState::HasWrapped), "{:?}", self.wrap_state);
+            self.wrap_state = WrapState::MayWrap;
+            self.cursor = self.guard.buffer.len()-1;
+        } else {
+            self.cursor -= 1;
+        }
+        true
+    }
+}
+
+
 fn try_get_slot<'a, T, const WRITE: bool>(mut guard: RingBufGuard<'a, T>, condvar: &'a Condvar) -> Result<RingBufSlot<'a, T, WRITE>, RingBufGuard<'a, T>> {
     let can_advance = guard.read_offset != guard.write_offset || (WRITE ^ guard.writer_wrapped);
     if can_advance {
@@ -187,6 +230,15 @@ impl<T> RingBuf<T> {
             .map_err(|guard| 
                 if guard.writer_closed {TryAcquireError::ChannelClosed} else {TryAcquireError::NotReady}
             )
+    }
+
+    pub fn read_iter(&self) -> ReadIterator<'_,T> {
+        let guard = self.inner.lock().unwrap();
+        ReadIterator {
+            wrap_state: if guard.writer_wrapped {WrapState::MayWrap} else {WrapState::MayNotWrap},
+            cursor: guard.read_offset,
+            guard,
+        }
     }
 
     pub fn write(&self) -> Result<RingBufSlot<'_,T,true>,AcquireError> {
@@ -279,5 +331,130 @@ mod test {
         assert!(ringbuf.try_write().is_ok());
         ringbuf.try_read().unwrap().do_not_consume();
         assert!(ringbuf.try_write().is_err());
+    }
+
+    #[test]
+    fn test_ringbuf_iter() {
+        let ringbuf = RingBuf::new(3,||0);
+        *ringbuf.try_write().unwrap()=1;
+        *ringbuf.try_write().unwrap()=2;
+        *ringbuf.try_write().unwrap()=3;
+        {
+            let guard = ringbuf.inner.lock().unwrap();
+            assert_eq!(guard.read_offset, guard.write_offset);
+        }
+
+        let mut iter = ringbuf.read_iter();
+        assert!(!iter.back());
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(&3));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(iter.back());
+
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(&3));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(!iter.back());
+
+        let ringbuf = RingBuf::new(5,||0);
+        *ringbuf.try_write().unwrap()=1;
+        *ringbuf.try_write().unwrap()=2;
+
+        let mut iter = ringbuf.read_iter();
+
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(!iter.back());
+
+        let ringbuf = RingBuf::new(3,||0);
+        ringbuf.try_write().unwrap();
+        *ringbuf.try_write().unwrap()=1;
+        *ringbuf.try_write().unwrap()=2;
+        ringbuf.try_read().unwrap(); // advance the read cursor to a nonzero position.
+
+        let mut iter = ringbuf.read_iter();
+
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(!iter.back());
+
+
+        // ensure the read range straddles the wrap point.
+        let ringbuf = RingBuf::new(3,||0);
+        ringbuf.try_write().unwrap();
+        ringbuf.try_read().unwrap(); 
+        ringbuf.try_write().unwrap();
+        ringbuf.try_read().unwrap();
+        *ringbuf.try_write().unwrap()=1;
+        *ringbuf.try_write().unwrap()=2;
+
+        let mut iter = ringbuf.read_iter();
+
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(!iter.back());
+
+
+        let ringbuf = RingBuf::new(5,||0);
+        ringbuf.try_write().unwrap();
+        ringbuf.try_read().unwrap(); 
+        ringbuf.try_write().unwrap();
+        ringbuf.try_read().unwrap(); 
+        ringbuf.try_write().unwrap();
+        ringbuf.try_read().unwrap(); 
+        *ringbuf.try_write().unwrap()=1;
+        *ringbuf.try_write().unwrap()=2;
+        *ringbuf.try_write().unwrap()=3;
+        *ringbuf.try_write().unwrap()=4;
+        *ringbuf.try_write().unwrap()=5;
+
+        {
+            let guard = ringbuf.inner.lock().unwrap();
+            assert_eq!(*guard.buffer, [3,4,5,1,2]);
+        }
+
+        let mut iter = ringbuf.read_iter();
+
+        assert!(!iter.back());
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(&3));
+        assert_eq!(iter.next(), Some(&4));
+        assert_eq!(iter.next(), Some(&5));
+        assert_eq!(iter.next(), None);
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(iter.back());
+        assert!(!iter.back());
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(&3));
+        assert_eq!(iter.next(), Some(&4));
+        assert_eq!(iter.next(), Some(&5));
+        assert_eq!(iter.next(), None);
+        
+        let ringbuf = RingBuf::new(5,||0);
+        let mut iter = ringbuf.read_iter();
+        assert!(!iter.back());
+        assert_eq!(iter.next(), None);
+        assert!(!iter.back());
     }
 }
