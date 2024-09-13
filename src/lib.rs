@@ -1,5 +1,6 @@
 #![feature(seek_stream_len)]
 #![feature(new_uninit)]
+#![feature(array_chunks)]
 
 use std::io::{Read, Seek};
 use std::ops::{Deref, DerefMut};
