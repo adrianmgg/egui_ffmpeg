@@ -224,7 +224,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
     let channel_layout = repacker.as_ref().map(|r| r.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
 
 
-    let queue = Arc::new(RingBuf::new(5, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
+    let queue = Arc::new(RingBuf::new(40, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
     let bytes_per_sample = match audio_decoder.format() {
         Sample::None => 0,
         Sample::U8(_) => 1,
@@ -246,7 +246,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
     let mut queue_consumer = AudioPlayer::new(queue.clone(),
         audio_decoder.rate(),
         bytes_per_sample * audio_decoder.ch_layout().channels() as usize,
-        dbg!(equilibrium(format)));
+        equilibrium(format));
     let stream = device.build_output_stream_raw(
         &cpal::StreamConfig {
             channels: audio_decoder.ch_layout().channels() as u16,
