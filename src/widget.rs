@@ -75,13 +75,13 @@ impl egui::Widget for &mut VideoPlayerWidget {
                 
                 if let Some(frame) = slot {
                     if !self.last_pts.is_some_and(|pts| pts != frame.pts().unwrap()) {
-                        let pixels = frame.data(0)
-                            .array_chunks::<4>()
+                        let pixels = frame.plane::<[u8;4]>(0)
+                            .into_iter()
                             .copied()
                             .map(|[r,g,b,a]| Color32::from_rgba_unmultiplied(r,g,b,a))
                             .collect::<Vec<_>>();
                         let image = egui::ColorImage {
-                            size: [frame.width() as usize, frame.height() as usize],
+                            size: [frame.stride(0) as usize / 4, frame.plane_height(0) as usize],
                             pixels
                         };
                         let options = TextureOptions::LINEAR;

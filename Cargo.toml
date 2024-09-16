@@ -9,13 +9,13 @@ crate-type=["lib"]
 [dependencies]
 bytemuck = "1.16.1"
 cpal = "0.15.3"
-eframe = "0.28.1"
-egui = "0.28.1"
-#eframe = { version = "0.28.1", default-features = false, features = ["wayland", "wgpu", "default_fonts"] }
-#egui = "0.28.1"
-ffmpeg-the-third = { version = "2.0.1", features = ["build"] }#, path="ffmpeg-the-third"}
+egui = {version="0.27.1",path="../egui/crates/egui"}
+ffmpeg-the-third = { version = "2.0.1" }#, features = ["build"] }#, path="ffmpeg-the-third"}
 image = { version = "0.25.1", default-features = false, features = ["png"] }
 oneshot = "0.1.8"
-pending = { version = "1.0", git = "https://github.com/vincent-sparks/pending" } # TODO put pending on crates
+pending = { version = "1.1", git = "https://github.com/vincent-sparks/pending" } # TODO put pending on crates
 replace_with = "0.1.7"
 thiserror = "1.0.63"
+
+[dev-dependencies]
+eframe = {version="0.27.1",path="../egui/crates/eframe"}
