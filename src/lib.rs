@@ -17,6 +17,7 @@ use image::ImageEncoder as _;
 
 mod custom_io;
 pub use custom_io::CustomIO;
+pub use cpal;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait as _};
 
@@ -130,12 +131,16 @@ impl AudioPlayer {
                     output_buffer = &mut output_buffer[input_data.len()..];
                 },
                 Err(_) => {
-                    repeat_to_fill(self.equilibrium, output_buffer);
+                    self.fill_with_silence(output_buffer);
                     return (pts, true);
                 },
             }
         }
         (pts, false)
+    }
+
+    pub fn fill_with_silence(&self, output_buffer: &mut [u8]) {
+        repeat_to_fill(self.equilibrium, output_buffer);
     }
 }
 
@@ -145,6 +150,8 @@ pub enum AudioOutputError {
     CreatingCodec(ffmpeg::Error),
     #[error("error creating decoder")]
     CreatingDecoder(ffmpeg::Error),
+    #[error("error creating resampler")]
+    CreatingResampler(ffmpeg::Error),
     #[error("no audio output device")]
     NoAudioOutputDevice,
     #[error("error creating audio output stream")]
@@ -161,7 +168,8 @@ pub struct SynchronizationInfo {
     audio_eof: AtomicBool,
 }
 
-fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamSink<F>) -> Result<(), ffmpeg::Error> {
+fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamSink<F>) -> Result<usize, ffmpeg::Error> {
+    let mut count = 0;
     match &mut handler.processing_step {
         Some((temp_frame, processing_step)) => {
             loop {
@@ -173,12 +181,14 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
                 // i'm honestly not sure if it will or not.  probably not measurably.  but it can't hurt.
                 match handler.decoder.receive_frame(temp_frame) {
                     Ok(()) => {
+                        count += 1;
+                        dbg!(temp_frame.pts());
                         match handler.output_queue.write() {
                             Ok(mut frame) => processing_step(&temp_frame, &mut frame),
                             Err(_) => return Err(ffmpeg::Error::Eof),
                         }
                     },
-                    Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => return Ok(()),
+                    Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => return Ok(count),
                     Err(e) => return Err(e),
                 }
             }
@@ -187,10 +197,10 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
             loop {
                 match handler.output_queue.write() {
                     Ok(mut frame) => match handler.decoder.receive_frame(&mut frame) {
-                        Ok(()) => {},
+                        Ok(()) => {count += 1;},
                         Err(ffmpeg::Error::Other{errno: ffmpeg::error::EAGAIN}) => {
                             frame.do_not_consume();
-                            return Ok(())
+                            return Ok(count)
                         },
                         Err(e) => return Err(e),
                     },
@@ -201,31 +211,89 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
     }
 }
 
-pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronization_info: Arc<SynchronizationInfo>) -> Result<(StreamSink<AudioFrame>, cpal::Stream), AudioOutputError> {
+pub(crate) struct CpalStreamArgs {
+    stream_config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    audio_source: AudioPlayer,
+}
+
+/*
+pub(crate) fn play_audio(queue_consumer: &mut AudioPlayer, synchronization_info: &SynchronizationInfo, data_out: &mut [u8]) {
+    if synchronization_info.is_playing.load(Ordering::Relaxed) {
+        let (pts, done) = queue_consumer.output(data_out);
+        if let Some(pts) = pts {
+            let ts = info.timestamp();
+            // TODO do this calculation properly
+            let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
+            let delta = dbg!(delta);
+            synchronization_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
+        }
+        synchronization_info.audio_eof.store(done, Ordering::Relaxed);
+    } else {
+        repeat_to_fill(queue_consumer.equilibrium, data_out);
+    }
+}
+*/
+
+pub struct CpalParameters {
+    format: cpal::SampleFormat,
+    rate: u32,
+    channels: u16,
+}
+
+pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Option<CpalParameters>) -> Result<(StreamSink<AudioFrame>, CpalStreamArgs), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
-    let host = cpal::default_host();
-    let device = host.default_output_device().ok_or(AudioOutputError::NoAudioOutputDevice)?;
 
-    use ffmpeg::util::format::sample::Type;
-    let sample_repack_to = match audio_decoder.format() {
-        Sample::U8(Type::Planar) => Some(Sample::U8(Type::Packed)),
-        Sample::I16(Type::Planar) => Some(Sample::I16(Type::Packed)),
-        Sample::I32(Type::Planar) => Some(Sample::I32(Type::Packed)),
-        Sample::I64(Type::Planar) => Some(Sample::I64(Type::Packed)),
-        Sample::F32(Type::Planar) => Some(Sample::F32(Type::Packed)),
-        Sample::F64(Type::Planar) => Some(Sample::F64(Type::Packed)),
-        _ => None,
+    let cpal_format = output_format.as_ref().map(|x| x.format).unwrap_or(match audio_decoder.format() {
+            Sample::None => panic!("unknown sample format"),
+            Sample::U8(_) => cpal::SampleFormat::U8,
+            Sample::I16(_) => cpal::SampleFormat::I16,
+            Sample::I32(_) => cpal::SampleFormat::I32,
+            Sample::I64(_) => cpal::SampleFormat::I64,
+            Sample::F32(_) => cpal::SampleFormat::F32,
+            Sample::F64(_) => cpal::SampleFormat::F64,
+    });
+
+    let ffmpeg_format = match cpal_format {
+            cpal::SampleFormat::U8 => Sample::U8(Type::Packed),
+            cpal::SampleFormat::I16 => Sample::I16(Type::Packed),
+            cpal::SampleFormat::I32 => Sample::I32(Type::Packed),
+            cpal::SampleFormat::I64 => Sample::I64(Type::Packed),
+            cpal::SampleFormat::F32 => Sample::F32(Type::Packed),
+            cpal::SampleFormat::F64 => Sample::F64(Type::Packed),
+            fmt => unimplemented!("sample format {} is not supported by ffmpeg", fmt),
     };
 
-    let repacker = sample_repack_to.map(|output_sample| audio_decoder.resampler2(output_sample, audio_decoder.ch_layout(), audio_decoder.rate()).expect("Failed to create audio resampler"));
+    use ffmpeg::util::format::sample::Type;
+    let (channels, rate) = if let Some(CpalParameters {channels, rate, ..}) = output_format {
+        (channels, rate)
+    } else {
+        (audio_decoder.ch_layout().channels() as u16, audio_decoder.rate())
+    };
+    
+    // we perform this check even if output_format is None (i.e. caller doesn't care) in case
+    // planar samples have to be converted to packed.
 
-    let channel_layout = repacker.as_ref().map(|r| r.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
+    let resampler = if 
+        ffmpeg_format != audio_decoder.format() ||
+        rate != audio_decoder.rate() ||
+        channels as u32 != audio_decoder.ch_layout().channels()
+    {
+        // TODO find a better method than default_for_channels() for this
+        Some(audio_decoder
+            .resampler2(ffmpeg_format,
+                ffmpeg::ChannelLayout::default_for_channels(channels as u32),
+                rate)
+            .map_err(AudioOutputError::CreatingResampler)?
+            )
+    } else {
+        None
+    };
 
 
-    let queue = Arc::new(RingBuf::new(40, || AudioFrame::new(sample_repack_to.unwrap_or(audio_decoder.format()), 8192, channel_layout)));
-    let bytes_per_sample = match audio_decoder.format() {
+    let bytes_per_sample = match ffmpeg_format {
         Sample::None => 0,
         Sample::U8(_) => 1,
         Sample::I16(_) => 2,
@@ -234,50 +302,26 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
         Sample::F32(_) => 4,
         Sample::F64(_) => 8,
     };
-    let format = match audio_decoder.format() {
-            Sample::None => panic!("unknown sample format"),
-            Sample::U8(_) => cpal::SampleFormat::U8,
-            Sample::I16(_) => cpal::SampleFormat::I16,
-            Sample::I32(_) => cpal::SampleFormat::I32,
-            Sample::I64(_) => cpal::SampleFormat::I64,
-            Sample::F32(_) => cpal::SampleFormat::F32,
-            Sample::F64(_) => cpal::SampleFormat::F64,
-    };
-    let mut queue_consumer = AudioPlayer::new(queue.clone(),
-        audio_decoder.rate(),
-        bytes_per_sample * audio_decoder.ch_layout().channels() as usize,
-        equilibrium(format));
-    let stream = device.build_output_stream_raw(
-        &cpal::StreamConfig {
-            channels: audio_decoder.ch_layout().channels() as u16,
-            sample_rate: cpal::SampleRate(audio_decoder.rate()),
+
+    let channel_layout = resampler.as_ref().map(|resampler| resampler.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
+
+    let queue = Arc::new(RingBuf::new(40, || AudioFrame::new(ffmpeg_format, 16384, channel_layout), "audio"));
+
+    let config = CpalStreamArgs {
+        stream_config: cpal::StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(rate),
             buffer_size: cpal::BufferSize::Default,
         },
-        // TODO handle the case where the audio driver can't accept this sample format.
-        format,
-        move |data, info| {
-            if synchronization_info.is_playing.load(Ordering::Relaxed) {
-                let (pts, done) = queue_consumer.output(data.bytes_mut());
-                if let Some(pts) = pts {
-                    let ts = info.timestamp();
-                    // TODO do this calculation properly
-                    let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
-                    synchronization_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
-                }
-                synchronization_info.audio_eof.store(done, Ordering::Relaxed);
-            } else {
-                repeat_to_fill(queue_consumer.equilibrium, data.bytes_mut());
-            }
-        }, 
-        move |error| {
-            eprintln!("audio playback error: {}", error);
-            // errors here are usually non fatal, so we don't close the stream here.
-        },
-        Some(Duration::from_millis(200)), // arbitrarily chosen
-        )?;
-    stream.play()?;
+        format: cpal_format,
+        audio_source: AudioPlayer::new(queue.clone(),
+            audio_decoder.rate(),
+            bytes_per_sample * audio_decoder.ch_layout().channels() as usize,
+            equilibrium(cpal_format)
+            ),
+    };
     println!("audio stream started");
-    let processing_step = repacker.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
+    let processing_step = resampler.map(|mut repacker| Box::new(move |input: &AudioFrame, output: &mut AudioFrame| {
         // operations are done in this order to reduce the probability of overflow while preserving as much precision as possible.
         let input_pts = ((input.pts().unwrap() * repacker.input().rate as i64) / 1000) * repacker.output().rate as i64;
         let next_pts = unsafe {ffmpeg::ffi::swr_next_pts(repacker.as_mut_ptr(), input_pts)};
@@ -310,12 +354,13 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, synchronizatio
         decoder: audio_decoder.0,
         processing_step,
         output_queue: queue,
-    }, stream))
-
-
+    }, config))
 }
 
-pub struct DecodeThreadArgs {pub synchronization_info: Arc<SynchronizationInfo>, pub video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>
+pub struct DecodeThreadArgs {
+    //pub synchronization_info: Arc<SynchronizationInfo>,
+    video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>,
+    cpal_sender: oneshot::Sender<CpalStreamArgs>,
 }
 
 // TODO don't make this a public API please GOD do not make this a public API
@@ -324,7 +369,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
     println!("format name is {}", input.format().name());
     input::dump(&input, 0, Some("<custom stream>"));
 
-    let DecodeThreadArgs {synchronization_info, video_sender} = args;
+    let DecodeThreadArgs {video_sender, cpal_sender} = args;
 
     let mut video_machinery = input.streams()
         .best(Type::Video)
@@ -338,7 +383,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
                 scaler.run(frame_in, frame_out).expect("scaler failed");
                 frame_out.set_pts(frame_in.pts());
             }))),
-            output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty())),
+            output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty(), "video")),
         };
         let _ = video_sender.send(video_machinery.output_queue.clone());
         (video_stream.index(), video_machinery)
@@ -346,49 +391,57 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
 
     let audio_stream = input.streams().best(Type::Audio);
 
-    let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>, cpal::Stream)> = audio_stream.as_ref().and_then(|stream| {
-        let res = create_audio_output(stream.parameters(), synchronization_info.clone());
-        if let Err(e) = &res {
-            eprintln!("unable to create audio output: {}.  playing video only.", e);
+    let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>)> = audio_stream.as_ref().and_then(|stream| {
+        match create_audio_output(stream.parameters(), None) {
+            Ok((streamsink, cpalstream)) => {
+                let _ = cpal_sender.send(cpalstream);
+                Some((stream.index(), streamsink))
+            },
+            Err(e) => {
+                eprintln!("unable to create audio output: {}.  playing video only.", e);
+                None
+            }
         }
-        if res.is_ok() {
-            synchronization_info.audio_major.store(true,Ordering::Relaxed);
-        }
-        res.ok().map(|(streamsink, cpalstream)| (stream.index(), streamsink, cpalstream))
     });
 
 
     let mut packet = ffmpeg::Packet::empty();
     loop {
-        match packet.read(&mut *input) {
-            Ok(()) => {},
-            Err(ffmpeg::Error::Eof) => break,
-            Err(e) => panic!("Error reading packet: {}", e),
-        }
-        //println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
-        if let Some((video_stream_idx, ref mut machinery)) = video_machinery {
-            if packet.stream() == video_stream_idx {
-                machinery.decoder.send_packet(&packet).expect("error decoding packet");
-                pump_decoder(machinery).expect("error decoding video");
-            } 
-        }
-        let mut audio_stop=false;
-        if let Some((audio_stream_idx, machinery, _stream)) = &mut audio_machinery {
-            if packet.stream() == *audio_stream_idx {
-                machinery.decoder.send_packet(&packet).expect("error decoding packet");
-                match pump_decoder(machinery) {
-                    Ok(()) => {},
-                    Err(ffmpeg::Error::Eof) => {audio_stop=true;},
-                    Err(e) => panic!("error decoding audio: {}", e),
+        loop {
+            match packet.read(&mut *input) {
+                Ok(()) => {},
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => panic!("Error reading packet: {}", e),
+            }
+            //println!("{}", synchronization_info.current_pts.load(Ordering::Relaxed));
+            if let Some((video_stream_idx, ref mut machinery)) = video_machinery {
+                if packet.stream() == video_stream_idx {
+                    machinery.decoder.send_packet(&packet).expect("error decoding packet");
+                    let count = pump_decoder(machinery).expect("error decoding video");
+                    if count != 1 {
+                        println!("video decoder returned {count} frames from a single packet");
+                    }
+                } 
+            }
+            if let Some((audio_stream_idx, machinery)) = &mut audio_machinery {
+                if packet.stream() == *audio_stream_idx {
+                    machinery.decoder.send_packet(&packet).expect("error decoding packet");
+                    match pump_decoder(machinery) {
+                        Ok(count) => {
+                            if count != 1 {
+                                println!("audio decoder returned {count} frames from a single packet");
+                            }
+                        },
+                        Err(ffmpeg::Error::Eof) => {},
+                        Err(e) => panic!("error decoding audio: {}", e),
+                    }
                 }
             }
         }
-        if audio_stop {
-            audio_machinery = None;
-        }
-
+        input.seek(0,..).expect("error rewinding");
     }
-    if let Some((_, ref mut machinery, _)) = audio_machinery {
+    /*
+    if let Some((_, ref mut machinery)) = audio_machinery {
         machinery.decoder.send_eof().unwrap();
         let _ = pump_decoder(machinery);
     }
@@ -396,4 +449,5 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
         machinery.decoder.send_eof().unwrap();
         let _ = pump_decoder(machinery);
     }
+    */
 }
