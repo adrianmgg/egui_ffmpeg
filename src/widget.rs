@@ -1,4 +1,4 @@
-use std::{sync::{atomic::Ordering, Arc}, time::Duration};
+use std::{sync::{atomic::Ordering, Arc}, time::{Duration, Instant}};
 
 use egui::{load::SizedTexture, Color32, Pos2, Rect, Rounding, Sense, TextureOptions, Vec2};
 use ffmpeg_the_third::frame::Video as VideoFrame;
@@ -15,6 +15,7 @@ pub struct VideoPlayerWidget {
     synchronization_info: Arc<SynchronizationInfo>,
     texture: Option<egui::TextureHandle>,
     last_pts: Option<i64>,
+    video_start_instant: Option<Instant>,
 }
 
 #[derive(thiserror::Error,Debug)]
@@ -39,6 +40,7 @@ impl VideoPlayerWidget {
             video_queue: video_receiver,
             texture: None,
             last_pts: None,
+            video_start_instant: None,
             audio_args: Some(cpal_receiver),
         }
     }
@@ -63,6 +65,35 @@ impl VideoPlayerWidget {
             }
         } else {
             panic!("try_start_audio() called after returning Some(...)");
+        }
+    }
+
+    fn get_current_pts(&mut self) -> i64 {
+        if self.synchronization_info.audio_major.load(Ordering::Relaxed) || !self.synchronization_info.is_playing.load(Ordering::Relaxed) {
+            // if audio major, the audio playback thread is advancing current_pts and we are
+            // expected to keep pace with it.
+            // if not playing, we are paused, and should keep showing the same frame over and over
+            // again until unpaused.  if is_playing is False, pts should not be advancing.
+            self.synchronization_info.current_pts.load(Ordering::Relaxed)
+        } else {
+            // otherwise, we must drive current_pts forward ourselves.
+            // XXX should this be done by a free-running clock, as here, or should we drive it
+            // from the PTS of the video frames?
+            // XXX (i.e. stall current_pts) during a lull in draw calls?
+        
+            match self.video_start_instant {
+                Some(instant) => {
+                    let current_pts = instant.elapsed().as_millis() as i64;
+                    self.synchronization_info.current_pts.store(current_pts, Ordering::Relaxed);
+                    current_pts
+                },
+                None => {
+                    // current_pts may be negative if we are at the very beginning of the file and the audio delay adjustment gets overzealous.
+                    let current_pts: u64 = self.synchronization_info.current_pts.load(Ordering::Relaxed).try_into().unwrap_or(0);
+                    self.video_start_instant = Some(Instant::now() - Duration::from_millis(current_pts));
+                    current_pts as i64
+                }
+            }
         }
     }
 
@@ -125,8 +156,8 @@ impl egui::Widget for &mut VideoPlayerWidget {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             let mut time_to_next_frame = None;
+            let current_pts = self.get_current_pts();
             if let Some(video) = self.video_queue.try_load() {
-                let current_pts = self.synchronization_info.current_pts.load(Ordering::Relaxed);
                 let mut iter = video.read_iter();
 
                 // we want the last frame with a pts less than or equal to current_pts.
