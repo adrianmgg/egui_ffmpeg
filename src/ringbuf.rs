@@ -207,14 +207,16 @@ pub struct RingBuf<T> {
     inner: Mutex<RingBufInner<T>>,
     read_ready: Condvar,
     write_ready: Condvar,
+    debug_name: &'static str,
 }
 
 impl<T> RingBuf<T> {
-    pub fn new(size: usize, init: impl FnMut()->T) -> Self {
+    pub fn new(size: usize, init: impl FnMut()->T, debug_name: &'static str) -> Self {
         Self {
             inner: Mutex::new(RingBufInner::new(size, init)),
             read_ready: Condvar::new(),
             write_ready: Condvar::new(),
+            debug_name,
         }
     }
 }
@@ -240,7 +242,7 @@ impl<T> RingBuf<T> {
                     if guard.writer_closed {
                         return Err(AcquireError::ChannelClosed);
                     } else {
-                        //eprintln!("queue underrun");
+                        eprintln!("{} queue underrun", self.debug_name);
                         self.read_ready.wait(guard).unwrap()
                     }
                 },
@@ -276,7 +278,7 @@ impl<T> RingBuf<T> {
             guard = match try_get_slot::<T, true>(guard, &self.read_ready) {
                 Ok(res) => return Ok(res),
                 Err(guard) => {
-                    //eprintln!("queue overrun");
+                    eprintln!("{} queue overrun", self.debug_name);
                     self.write_ready.wait(guard).unwrap()
                 },
             }
@@ -305,7 +307,7 @@ mod test {
     use super::*;
     #[test]
     fn test_ringbuf_one_slot() {
-        let ringbuf = RingBuf::new(1, || 0);
+        let ringbuf = RingBuf::new(1, || 0, "");
         assert!(ringbuf.try_read().is_err());
         *ringbuf.try_write().unwrap() = 1;
         assert!(ringbuf.try_write().is_err());
@@ -316,7 +318,7 @@ mod test {
 
     #[test]
     fn test_ringbuf_multi_slot() {
-        let ringbuf = RingBuf::new(3, || 0);
+        let ringbuf = RingBuf::new(3, || 0, "");
         assert!(ringbuf.try_read().is_err());
         *ringbuf.try_write().unwrap() = 1;
         *ringbuf.try_write().unwrap() = 2;
@@ -343,7 +345,7 @@ mod test {
     
     #[test]
     fn test_ringbuf_end() {
-        let ringbuf = RingBuf::new(3,||0);
+        let ringbuf = RingBuf::new(3,||0, "");
         assert!(ringbuf.try_write().is_ok());
         assert!(ringbuf.try_read().is_ok());
         assert!(ringbuf.try_write().is_ok());
@@ -361,7 +363,7 @@ mod test {
 
     #[test]
     fn test_ringbuf_iter() {
-        let ringbuf = RingBuf::new(3,||0);
+        let ringbuf = RingBuf::new(3,||0, "");
         *ringbuf.try_write().unwrap()=1;
         *ringbuf.try_write().unwrap()=2;
         *ringbuf.try_write().unwrap()=3;
@@ -389,7 +391,7 @@ mod test {
         assert!(iter.back());
         assert!(!iter.back());
 
-        let ringbuf = RingBuf::new(5,||0);
+        let ringbuf = RingBuf::new(5,||0, "");
         *ringbuf.try_write().unwrap()=1;
         *ringbuf.try_write().unwrap()=2;
 
@@ -402,7 +404,7 @@ mod test {
         assert!(iter.back());
         assert!(!iter.back());
 
-        let ringbuf = RingBuf::new(3,||0);
+        let ringbuf = RingBuf::new(3,||0, "");
         ringbuf.try_write().unwrap();
         *ringbuf.try_write().unwrap()=1;
         *ringbuf.try_write().unwrap()=2;
@@ -419,7 +421,7 @@ mod test {
 
 
         // ensure the read range straddles the wrap point.
-        let ringbuf = RingBuf::new(3,||0);
+        let ringbuf = RingBuf::new(3,||0, "");
         ringbuf.try_write().unwrap();
         ringbuf.try_read().unwrap(); 
         ringbuf.try_write().unwrap();
@@ -437,7 +439,7 @@ mod test {
         assert!(!iter.back());
 
 
-        let ringbuf = RingBuf::new(5,||0);
+        let ringbuf = RingBuf::new(5,||0, "");
         ringbuf.try_write().unwrap();
         ringbuf.try_read().unwrap(); 
         ringbuf.try_write().unwrap();
@@ -477,7 +479,7 @@ mod test {
         assert_eq!(iter.next(), Some(&5));
         assert_eq!(iter.next(), None);
         
-        let ringbuf = RingBuf::new(5,||0);
+        let ringbuf = RingBuf::new(5,||0, "");
         let mut iter = ringbuf.read_iter();
         assert!(!iter.back());
         assert_eq!(iter.next(), None);
