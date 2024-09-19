@@ -106,7 +106,7 @@ impl<'a, T, const WRITE: bool> RingBufSlot<'a,T,WRITE> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug,Clone,Copy)]
 enum WrapState {
     MayNotWrap,
     MayWrap,
@@ -125,6 +125,12 @@ impl<'a,T> Deref for NonNotifyingSlot<'a,T> {
     }
 }
 
+pub struct RingBufIndex {
+    iterator_ptr: *const (),
+    cursor: usize,
+    wrap_state: WrapState,
+}
+
 pub struct ReadIterator<'a, T> {
     guard: RingBufGuard<'a, T>,
     cursor: usize,
@@ -133,18 +139,29 @@ pub struct ReadIterator<'a, T> {
 }
 
 impl<'a, T> ReadIterator<'a, T> {
-    pub fn next(&mut self) -> Option<&T> {
+    pub fn next(&mut self) -> Option<(RingBufIndex, &T)> {
         if self.cursor == self.guard.write_offset && !matches!(self.wrap_state, WrapState::MayWrap) {
             return None;
         }
         let res = &self.guard.buffer[self.cursor];
+        let index = RingBufIndex {
+            iterator_ptr: self as *const Self as *const (),
+            cursor: self.cursor,
+            wrap_state: self.wrap_state,
+        };
         self.cursor += 1;
         if self.cursor >= self.guard.buffer.len() {
             debug_assert!(matches!(self.wrap_state, WrapState::MayWrap), "{:?}", self.wrap_state);
             self.wrap_state = WrapState::HasWrapped;
             self.cursor = 0;
         }
-        Some(res)
+        Some((index, res))
+    }
+
+    pub fn reset_to(&mut self, idx: RingBufIndex) {
+        debug_assert!(std::ptr::eq(idx.iterator_ptr, self as *const Self as *const _), "RingBufIndex may only be consumed by the same ReadIterator that created it");
+        self.cursor = idx.cursor;
+        self.wrap_state = idx.wrap_state;
     }
     pub fn back(&mut self) -> bool {
         if self.cursor == self.guard.read_offset && !matches!(self.wrap_state, WrapState::HasWrapped) {

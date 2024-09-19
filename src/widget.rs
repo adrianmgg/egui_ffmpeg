@@ -2,6 +2,7 @@ use std::{sync::{atomic::Ordering, Arc}, time::{Duration, Instant}};
 
 use egui::{load::SizedTexture, Color32, Pos2, Rect, Rounding, Sense, TextureOptions, Vec2};
 use ffmpeg_the_third::frame::Video as VideoFrame;
+use oneshot::TryRecvError;
 
 use crate::{ringbuf::RingBuf, DecodeThreadArgs, CpalStreamArgs, SynchronizationInfo};
 
@@ -33,7 +34,7 @@ impl VideoPlayerWidget {
         let synchronization_info: Arc<SynchronizationInfo> = Default::default();
         synchronization_info.is_playing.store(true, Ordering::Relaxed);
         let sync_info2 = synchronization_info.clone();
-        std::thread::spawn(move || input_create(DecodeThreadArgs{video_sender, cpal_sender}));
+        std::thread::spawn(move || input_create(DecodeThreadArgs{synchronization_info, video_sender, cpal_sender}));
 
         Self {
             synchronization_info: sync_info2,
@@ -61,7 +62,8 @@ impl VideoPlayerWidget {
                 Ok(args) => {
                     Some(self.start_audio_impl(args).map(Option::Some))
                 },
-                Err(_e) => {Some(Ok(None))},
+                Err(TryRecvError::Disconnected) => {Some(Ok(None))},
+                Err(TryRecvError::Empty) => None,
             }
         } else {
             panic!("try_start_audio() called after returning Some(...)");
@@ -76,18 +78,20 @@ impl VideoPlayerWidget {
             // again until unpaused.  if is_playing is False, pts should not be advancing.
             self.synchronization_info.current_pts.load(Ordering::Relaxed)
         } else {
+            println!("video major");
             // otherwise, we must drive current_pts forward ourselves.
             // XXX should this be done by a free-running clock, as here, or should we drive it
             // from the PTS of the video frames?
-            // XXX (i.e. stall current_pts) during a lull in draw calls?
         
             match self.video_start_instant {
                 Some(instant) => {
+                    println!("video advanced");
                     let current_pts = instant.elapsed().as_millis() as i64;
                     self.synchronization_info.current_pts.store(current_pts, Ordering::Relaxed);
                     current_pts
                 },
                 None => {
+                    println!("video started");
                     // current_pts may be negative if we are at the very beginning of the file and the audio delay adjustment gets overzealous.
                     let current_pts: u64 = self.synchronization_info.current_pts.load(Ordering::Relaxed).try_into().unwrap_or(0);
                     self.video_start_instant = Some(Instant::now() - Duration::from_millis(current_pts));
@@ -162,18 +166,43 @@ impl egui::Widget for &mut VideoPlayerWidget {
 
                 // we want the last frame with a pts less than or equal to current_pts.
                 println!("starting iteration, current_pts {}", current_pts);
-                while let Some(frame) = iter.next() {
+                let mut found_any_less = false;
+                // current_best will be the least pts found if found_any_less is false and
+                // the greatest pts less than current_pts if found_any_greater is true
+                let mut current_best = None;
+                while let Some((idx, frame)) = iter.next() {
                     if let Some(pts) = frame.pts() {
-                        println!("pts={}", pts);
-                        if pts > current_pts {
-                            time_to_next_frame = Some(Duration::from_millis((pts - current_pts) as u64));
-                            iter.back();
-                            break;
+                        println!("found pts {}", pts);
+                        let Some((_, current_best_pts)) = current_best else {
+                            current_best = Some((idx, pts));
+                            if pts < current_pts {
+                                found_any_less = true;
+                            }
+                            continue;
+                        };
+                        println!("current best is {}", current_best_pts);
+                        if found_any_less {
+                            println!("new current best");
+                            if pts <= current_pts && pts >= current_best_pts {
+                                current_best = Some((idx, pts));
+                            }
+                        } else {
+                            if pts < current_best_pts {
+                                println!("new current best, but not found any less yet");
+                                current_best = Some((idx, pts));
+                                if pts <= current_pts {
+                                    println!("found first less");
+                                    found_any_less=true;
+                                }
+                            }
                         }
                     }
                 }
-                iter.back();
-                let slot = iter.mark();
+
+                let slot = current_best.and_then(|(idx, _)| {
+                    iter.reset_to(idx);
+                    iter.mark()
+                });
                 
                 if let Some(frame) = slot {
                     if !self.last_pts.is_some_and(|pts| pts == frame.pts().unwrap()) {
