@@ -125,6 +125,7 @@ impl<'a,T> Deref for NonNotifyingSlot<'a,T> {
     }
 }
 
+#[derive(Clone,Copy)]
 pub struct RingBufIndex {
     iterator_ptr: *const (),
     cursor: usize,
@@ -391,18 +392,18 @@ mod test {
 
         let mut iter = ringbuf.read_iter();
         assert!(!iter.back());
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), Some(&3));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), Some(&3));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(iter.back());
 
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), Some(&3));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), Some(&3));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(iter.back());
@@ -414,9 +415,9 @@ mod test {
 
         let mut iter = ringbuf.read_iter();
 
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(!iter.back());
@@ -429,9 +430,9 @@ mod test {
 
         let mut iter = ringbuf.read_iter();
 
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(!iter.back());
@@ -448,9 +449,9 @@ mod test {
 
         let mut iter = ringbuf.read_iter();
 
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(!iter.back());
@@ -477,29 +478,29 @@ mod test {
         let mut iter = ringbuf.read_iter();
 
         assert!(!iter.back());
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), Some(&3));
-        assert_eq!(iter.next(), Some(&4));
-        assert_eq!(iter.next(), Some(&5));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), Some(&3));
+        assert_eq!(iter.next().map(|x|x.1), Some(&4));
+        assert_eq!(iter.next().map(|x|x.1), Some(&5));
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(iter.back());
         assert!(iter.back());
         assert!(iter.back());
         assert!(iter.back());
         assert!(iter.back());
         assert!(!iter.back());
-        assert_eq!(iter.next(), Some(&1));
-        assert_eq!(iter.next(), Some(&2));
-        assert_eq!(iter.next(), Some(&3));
-        assert_eq!(iter.next(), Some(&4));
-        assert_eq!(iter.next(), Some(&5));
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), Some(&1));
+        assert_eq!(iter.next().map(|x|x.1), Some(&2));
+        assert_eq!(iter.next().map(|x|x.1), Some(&3));
+        assert_eq!(iter.next().map(|x|x.1), Some(&4));
+        assert_eq!(iter.next().map(|x|x.1), Some(&5));
+        assert_eq!(iter.next().map(|x|x.1), None);
         
         let ringbuf = RingBuf::new(5,||0, "");
         let mut iter = ringbuf.read_iter();
         assert!(!iter.back());
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next().map(|x|x.1), None);
         assert!(!iter.back());
     }
 }
