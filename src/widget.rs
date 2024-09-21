@@ -117,7 +117,7 @@ impl VideoPlayerWidget {
                         let ts = info.timestamp();
                         // TODO do this calculation properly
                         let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
-                        let delta = dbg!(delta);
+                        //let delta = dbg!(delta);
                         sync_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
                     }
                     sync_info.audio_eof.store(done, Ordering::Relaxed);
@@ -143,7 +143,11 @@ impl VideoPlayerWidget {
         let is_playing = if play_button_resp.clicked() {
             // fetch_not() returns what the value was _before_ it was inverted, so we must invert
             // it again to get the value after.
-            !self.synchronization_info.is_playing.fetch_not(Ordering::Relaxed)
+            let new_val = !self.synchronization_info.is_playing.fetch_not(Ordering::Relaxed);
+            if !new_val {
+                self.video_start_instant = None;
+            }
+            new_val
         } else {
             self.synchronization_info.is_playing.load(Ordering::Relaxed)
         };
@@ -165,14 +169,12 @@ impl egui::Widget for &mut VideoPlayerWidget {
                 let mut iter = video.read_iter();
 
                 // we want the last frame with a pts less than or equal to current_pts.
-                println!("starting iteration, current_pts {}", current_pts);
                 let mut found_any_less = false;
                 // current_best will be the least pts found if found_any_less is false and
                 // the greatest pts less than current_pts if found_any_greater is true
                 let mut current_best = None;
                 while let Some((idx, frame)) = iter.next() {
                     if let Some(pts) = frame.pts() {
-                        println!("found pts {}", pts);
                         let Some((_, current_best_pts)) = current_best else {
                             current_best = Some((idx, pts));
                             if pts < current_pts {
@@ -180,24 +182,27 @@ impl egui::Widget for &mut VideoPlayerWidget {
                             }
                             continue;
                         };
-                        println!("current best is {}", current_best_pts);
                         if found_any_less {
-                            println!("new current best");
                             if pts <= current_pts && pts >= current_best_pts {
                                 current_best = Some((idx, pts));
                             }
                         } else {
                             if pts < current_best_pts {
-                                println!("new current best, but not found any less yet");
                                 current_best = Some((idx, pts));
                                 if pts <= current_pts {
-                                    println!("found first less");
                                     found_any_less=true;
                                 }
                             }
                         }
                     }
                 }
+
+                time_to_next_frame = current_best.and_then(|(idx, _)| {
+                    iter.reset_to(idx);
+                    iter.next(); // this will return the pts we already know
+                    iter.next().and_then(|(_, frame)| frame.pts()).map(|next_pts| Duration::from_millis(next_pts as u64 - current_pts as u64))
+                });
+
 
                 let slot = current_best.and_then(|(idx, _)| {
                     iter.reset_to(idx);
@@ -238,6 +243,7 @@ impl egui::Widget for &mut VideoPlayerWidget {
             }
             if self.synchronization_info.is_playing.load(Ordering::Relaxed) {
                 if let Some(time) = time_to_next_frame {
+                    println!("requesting repaint in {:?}", time);
                     ui.ctx().request_repaint_after(time);
                 } else {
                     println!("unknown repaint time, requesting immediate repaint");
