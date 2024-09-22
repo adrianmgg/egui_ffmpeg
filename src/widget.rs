@@ -17,6 +17,7 @@ pub struct VideoPlayerWidget {
     texture: Option<egui::TextureHandle>,
     last_pts: Option<i64>,
     video_start_instant: Option<Instant>,
+    _debug_last_repaint: Option<(Instant, i64)>,
 }
 
 #[derive(thiserror::Error,Debug)]
@@ -43,6 +44,7 @@ impl VideoPlayerWidget {
             last_pts: None,
             video_start_instant: None,
             audio_args: Some(cpal_receiver),
+            _debug_last_repaint: None,
         }
     }
 
@@ -165,6 +167,10 @@ impl egui::Widget for &mut VideoPlayerWidget {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             let mut time_to_next_frame = None;
             let current_pts = self.get_current_pts();
+            if let Some((instant, pts)) = self._debug_last_repaint {
+                println!("time since last repaint: {:?}, pts advance since last repaint: {}ms", instant.elapsed(), current_pts-pts);
+            }
+            self._debug_last_repaint = Some((Instant::now(), current_pts));
             if let Some(video) = self.video_queue.try_load() {
                 let mut iter = video.read_iter();
 
@@ -226,6 +232,8 @@ impl egui::Widget for &mut VideoPlayerWidget {
                         } else {
                             self.texture = Some(ui.ctx().load_texture("video", image, options));
                         }
+                    } else {
+                        //println!("drawing same frame as last time");
                     }
                     ui.add(egui::Image::new(SizedTexture::from_handle(self.texture.as_ref().unwrap()))
                         .maintain_aspect_ratio(true)
