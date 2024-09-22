@@ -182,7 +182,6 @@ fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamS
                 match handler.decoder.receive_frame(temp_frame) {
                     Ok(()) => {
                         count += 1;
-                        dbg!(temp_frame.pts());
                         match handler.output_queue.write() {
                             Ok(mut frame) => processing_step(&temp_frame, &mut frame),
                             Err(_) => return Err(ffmpeg::Error::Eof),
@@ -241,7 +240,7 @@ pub struct CpalParameters {
     channels: u16,
 }
 
-pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Option<CpalParameters>) -> Result<(StreamSink<AudioFrame>, CpalStreamArgs), AudioOutputError> {
+fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Option<CpalParameters>) -> Result<(StreamSink<AudioFrame>, CpalStreamArgs), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
@@ -305,7 +304,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format:
 
     let channel_layout = resampler.as_ref().map(|resampler| resampler.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
 
-    let queue = Arc::new(RingBuf::new(40, || AudioFrame::new(ffmpeg_format, 16384, channel_layout), "audio"));
+    let queue = Arc::new(RingBuf::new(160, || AudioFrame::new(ffmpeg_format, 16384, channel_layout), "audio"));
 
     let config = CpalStreamArgs {
         stream_config: cpal::StreamConfig {
@@ -358,7 +357,7 @@ pub fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format:
 }
 
 pub struct DecodeThreadArgs {
-    //pub synchronization_info: Arc<SynchronizationInfo>,
+    pub synchronization_info: Arc<SynchronizationInfo>,
     video_sender: oneshot::Sender<Arc<RingBuf<VideoFrame>>>,
     cpal_sender: oneshot::Sender<CpalStreamArgs>,
 }
@@ -369,7 +368,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
     println!("format name is {}", input.format().name());
     input::dump(&input, 0, Some("<custom stream>"));
 
-    let DecodeThreadArgs {video_sender, cpal_sender} = args;
+    let DecodeThreadArgs {synchronization_info, video_sender, cpal_sender} = args;
 
     let mut video_machinery = input.streams()
         .best(Type::Video)
@@ -383,7 +382,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
                 scaler.run(frame_in, frame_out).expect("scaler failed");
                 frame_out.set_pts(frame_in.pts());
             }))),
-            output_queue: Arc::new(RingBuf::new(20, || VideoFrame::empty(), "video")),
+            output_queue: Arc::new(RingBuf::new(40, || VideoFrame::empty(), "video")),
         };
         let _ = video_sender.send(video_machinery.output_queue.clone());
         (video_stream.index(), video_machinery)
