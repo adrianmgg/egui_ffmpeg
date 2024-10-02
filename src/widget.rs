@@ -16,7 +16,6 @@ pub struct VideoPlayerWidget {
     synchronization_info: Arc<SynchronizationInfo>,
     texture: Option<egui::TextureHandle>,
     last_pts: Option<i64>,
-    video_start_instant: Option<Instant>,
     _debug_last_repaint: Option<(Instant, i64)>,
 }
 
@@ -42,7 +41,6 @@ impl VideoPlayerWidget {
             video_queue: video_receiver,
             texture: None,
             last_pts: None,
-            video_start_instant: None,
             audio_args: Some(cpal_receiver),
             _debug_last_repaint: None,
         }
@@ -73,33 +71,15 @@ impl VideoPlayerWidget {
     }
 
     fn get_current_pts(&mut self) -> i64 {
-        if self.synchronization_info.audio_major.load(Ordering::Relaxed) || !self.synchronization_info.is_playing.load(Ordering::Relaxed) {
-            // if audio major, the audio playback thread is advancing current_pts and we are
-            // expected to keep pace with it.
-            // if not playing, we are paused, and should keep showing the same frame over and over
-            // again until unpaused.  if is_playing is False, pts should not be advancing.
-            self.synchronization_info.current_pts.load(Ordering::Relaxed)
+        // fetching two different atomic integers and performing arithmetic to combine their values
+        // like i'm doing here does technically cause a race condition, but for this video player
+        // app, the worst case scenario is that a video frame gets displayed a few milliseconds
+        // before or after it should have been.  i don't think we care.  and i'm going to leave the
+        // performance comparison between this and using a mutex as a Future Enhancement(tm)
+        if self.synchronization_info.is_playing.load(Ordering::Relaxed) {
+            self.synchronization_info.current_pts.load(Ordering::Relaxed) + i64::try_from(self.synchronization_info.last_pts_update.millis_since_last_reset()).expect("negative millis since last reset????")
         } else {
-            println!("video major");
-            // otherwise, we must drive current_pts forward ourselves.
-            // XXX should this be done by a free-running clock, as here, or should we drive it
-            // from the PTS of the video frames?
-        
-            match self.video_start_instant {
-                Some(instant) => {
-                    println!("video advanced");
-                    let current_pts = instant.elapsed().as_millis() as i64;
-                    self.synchronization_info.current_pts.store(current_pts, Ordering::Relaxed);
-                    current_pts
-                },
-                None => {
-                    println!("video started");
-                    // current_pts may be negative if we are at the very beginning of the file and the audio delay adjustment gets overzealous.
-                    let current_pts: u64 = self.synchronization_info.current_pts.load(Ordering::Relaxed).try_into().unwrap_or(0);
-                    self.video_start_instant = Some(Instant::now() - Duration::from_millis(current_pts));
-                    current_pts as i64
-                }
-            }
+            self.synchronization_info.current_pts.load(Ordering::Relaxed)
         }
     }
 
@@ -121,6 +101,7 @@ impl VideoPlayerWidget {
                         let delta = ts.playback.duration_since(&ts.callback).expect("playback timestamp should always be after callback timestamp");
                         //let delta = dbg!(delta);
                         sync_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
+                        sync_info.last_pts_update.reset();
                     }
                     sync_info.audio_eof.store(done, Ordering::Relaxed);
                 } else {
@@ -147,7 +128,10 @@ impl VideoPlayerWidget {
             // it again to get the value after.
             let new_val = !self.synchronization_info.is_playing.fetch_not(Ordering::Relaxed);
             if !new_val {
-                self.video_start_instant = None;
+                // TODO figure out how (or if!) I should adjust current_pts when the video gets
+                // paused.
+            } else {
+                self.synchronization_info.last_pts_update.reset();
             }
             new_val
         } else {
@@ -167,9 +151,9 @@ impl egui::Widget for &mut VideoPlayerWidget {
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
             let mut time_to_next_frame = None;
             let current_pts = self.get_current_pts();
-            if let Some((instant, pts)) = self._debug_last_repaint {
-                println!("time since last repaint: {:?}, pts advance since last repaint: {}ms", instant.elapsed(), current_pts-pts);
-            }
+            //if let Some((instant, pts)) = self._debug_last_repaint {
+            //    println!("time since last repaint: {:?}, pts advance since last repaint: {}ms", instant.elapsed(), current_pts-pts);
+            //}
             self._debug_last_repaint = Some((Instant::now(), current_pts));
             if let Some(video) = self.video_queue.try_load() {
                 let mut iter = video.read_iter();
@@ -251,7 +235,7 @@ impl egui::Widget for &mut VideoPlayerWidget {
             }
             if self.synchronization_info.is_playing.load(Ordering::Relaxed) {
                 if let Some(time) = time_to_next_frame {
-                    println!("requesting repaint in {:?}", time);
+                    //println!("requesting repaint in {:?}", time);
                     ui.ctx().request_repaint_after(time);
                 } else {
                     println!("unknown repaint time, requesting immediate repaint");

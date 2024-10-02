@@ -1,13 +1,15 @@
 #![feature(seek_stream_len)]
 #![feature(new_uninit)]
 #![feature(array_chunks)]
+#![feature(ptr_metadata)]
 
 use std::io::{Read, Seek};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use ffmpeg_the_third::codec::Id;
 use ffmpeg_the_third::format::{Pixel, Sample};
 use ffmpeg_the_third::ChannelLayoutMask;
 use ffmpeg_the_third::{ffi::av_dump_format, format::context::input, media::Type};
@@ -160,12 +162,34 @@ pub enum AudioOutputError {
     PlayStreamError(#[from] cpal::PlayStreamError),
 }
 
+pub struct TimeSinceLastReset {
+    epoch: Instant,
+    time_since: AtomicU64,
+}
+
+impl TimeSinceLastReset {
+    pub fn last_reset_instant(&self) -> Instant {
+        self.epoch + Duration::from_millis(self.time_since.load(Ordering::Relaxed))
+    }
+    pub fn millis_since_last_reset(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64 - self.time_since.load(Ordering::Relaxed)
+    }
+    pub fn reset(&self) {
+        self.time_since.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+impl Default for TimeSinceLastReset {
+    fn default() -> Self { Self { epoch: Instant::now(), time_since: AtomicU64::from(0) } }
+}
+
 #[derive(Default)]
 pub struct SynchronizationInfo {
     is_playing: AtomicBool,
     audio_major: AtomicBool,
     current_pts: AtomicI64,
     audio_eof: AtomicBool,
+    last_pts_update: TimeSinceLastReset,
 }
 
 fn pump_decoder<F: Deref<Target=ffmpeg::Frame> + DerefMut>(handler: &mut StreamSink<F>) -> Result<usize, ffmpeg::Error> {
@@ -304,7 +328,7 @@ fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Opt
 
     let channel_layout = resampler.as_ref().map(|resampler| resampler.output().channel_layout).unwrap_or(ChannelLayoutMask::all());
 
-    let queue = Arc::new(RingBuf::new(160, || AudioFrame::new(ffmpeg_format, 16384, channel_layout), "audio"));
+    let queue = Arc::new(RingBuf::new(320, || AudioFrame::new(ffmpeg_format, 16384, channel_layout), "audio"));
 
     let config = CpalStreamArgs {
         stream_config: cpal::StreamConfig {
@@ -374,11 +398,23 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
         .best(Type::Video)
         .map(|video_stream| {
         let video_ctx = ffmpeg::codec::Context::from_parameters(video_stream.parameters()).expect("unable to create video context");
-        let video_decoder = video_ctx.decoder().video().expect("unable to create video decoder");
-        let mut scaler = video_decoder.converter(Pixel::RGBA).expect("unable to create color converter");
+        //let video_decoder = video_ctx.decoder().video().expect("unable to create video decoder");
+        // FFmpeg's native VP9 decoder does not support transparency
+        // so in order to support that we must force it to use libvpx.
+        let video_codec = match video_ctx.id() {
+            //Id::VP8 => ffmpeg::codec::decoder::find_by_name("libvpx-vp8").expect("unable to locate libvpx-vp8 codec"),
+            Id::VP9 => ffmpeg::codec::decoder::find_by_name("libvpx-vp9").expect("unable to locate libvpx-vp9 codec"),
+            id => ffmpeg::codec::decoder::find(id).expect("unable to locate video decoder"),
+        };
+        let video_decoder = video_ctx.decoder().open_as(video_codec).and_then(|x|x.video()).expect("unable to create video decoder");
+        //let mut scaler = video_decoder.converter(Pixel::RGBA).expect("unable to create color converter");
+        let mut scaler = None;
         let video_machinery = StreamSink {
             decoder: video_decoder.0,
-            processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in, frame_out| {
+            processing_step: Some((VideoFrame::empty(), Box::new(move |frame_in: &VideoFrame, frame_out| {
+                // wait to create the color converter until the video stream starts,
+                // in case the pixel format changes from YUV to YUVA.
+                let scaler = scaler.get_or_insert_with(|| frame_in.converter(Pixel::RGBA).expect("unable to create color converter"));
                 scaler.run(frame_in, frame_out).expect("scaler failed");
                 frame_out.set_pts(frame_in.pts());
             }))),
@@ -406,6 +442,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
 
     let mut packet = ffmpeg::Packet::empty();
     loop {
+        let mut av_offset = 0i64;
         loop {
             match packet.read(&mut *input) {
                 Ok(()) => {},
@@ -420,6 +457,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
                     if count != 1 {
                         println!("video decoder returned {count} frames from a single packet");
                     }
+                    av_offset += count as i64;
                 } 
             }
             if let Some((audio_stream_idx, machinery)) = &mut audio_machinery {
@@ -430,6 +468,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
                             if count != 1 {
                                 println!("audio decoder returned {count} frames from a single packet");
                             }
+                            av_offset -= count as i64;
                         },
                         Err(ffmpeg::Error::Eof) => {},
                         Err(e) => panic!("error decoding audio: {}", e),
