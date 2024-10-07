@@ -1,5 +1,5 @@
 #![feature(seek_stream_len)]
-#![feature(new_uninit)]
+#![feature(slice_as_chunks)]
 #![feature(array_chunks)]
 #![feature(ptr_metadata)]
 
@@ -44,27 +44,20 @@ fn equilibrium(format: cpal::SampleFormat) -> &'static [u8] {
     }
 }
 
+fn repeat_chunks<const N: usize>(input: &[u8], output: &mut [u8]) {
+    let ([input],[]) = input.as_chunks::<N>() else {unreachable!()};
+    let (output, []) = output.as_chunks_mut::<N>() else {panic!("output slice length was not a multiple of {}", N)};
+    output.fill(*input)
+}
+
 fn repeat_to_fill(input: &[u8], output: &mut [u8]) {
-    assert!(output.len() % input.len() == 0);
-    // this algorithm is borrowed from std::Vec::repeat()
-    // first, we copy our input into the first bit of the output
-    output[..input.len()].copy_from_slice(input);
-    let mut filled = input.len();
-    // second, we repeatedly double how much of the output is filled with our repetitions by
-    // copying what we've already copied to the output to the next part of the output (2..4 gets
-    // copied from 0..2, 4..8 gets copied from 0..4, 8..16 gets copied from 0..8, etc.)
-    while filled < output.len() / 2 {
-        let (head, tail) = output.split_at_mut(filled);
-        tail[..filled].copy_from_slice(head);
-        filled *= 2;
+    match input.len() {
+        1 => output.fill(input[0]),
+        2 => repeat_chunks::<2>(input, output),
+        4 => repeat_chunks::<4>(input, output),
+        8 => repeat_chunks::<8>(input, output),
+        len => panic!("unknown slice length {}", len),
     }
-    // finally, just in case the output length isn't a power of two, we copy the first part of the
-    // input to the last remaining bit of the output (i.e. 16..20 gets copied from 0..4)
-    // note that since we are guaranteed by the loop condition to be at least halfway through the
-    // slice, we only have to do this once.
-    let remainder = output.len() - filled;
-    let (head, tail) = output.split_at_mut(filled);
-    tail.copy_from_slice(&head[..remainder]);
 }
 
 pub struct StreamSink<T> {
