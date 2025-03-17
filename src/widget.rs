@@ -70,17 +70,21 @@ impl VideoPlayerWidget {
         }
     }
 
-    fn get_current_pts(&mut self) -> i64 {
+    fn get_current_pts(&self) -> i64 {
         // fetching two different atomic integers and performing arithmetic to combine their values
         // like i'm doing here does technically cause a race condition, but for this video player
         // app, the worst case scenario is that a video frame gets displayed a few milliseconds
         // before or after it should have been.  i don't think we care.  and i'm going to leave the
         // performance comparison between this and using a mutex as a Future Enhancement(tm)
         if self.synchronization_info.is_playing.load(Ordering::Relaxed) {
-            self.synchronization_info.current_pts.load(Ordering::Relaxed) + i64::try_from(self.synchronization_info.last_pts_update.millis_since_last_reset()).expect("negative millis since last reset????")
+            self.get_playing_current_pts()
         } else {
             self.synchronization_info.current_pts.load(Ordering::Relaxed)
         }
+    }
+
+    fn get_playing_current_pts(&self) -> i64 {
+        self.synchronization_info.current_pts.load(Ordering::Relaxed) + i64::try_from(self.synchronization_info.last_pts_update.millis_since_last_reset()).expect("negative millis since last reset????")
     }
 
     fn start_audio_impl(&self, args: CpalStreamArgs) -> Result<cpal::Stream,StartAudioError> {
@@ -130,6 +134,7 @@ impl VideoPlayerWidget {
             if !new_val {
                 // TODO figure out how (or if!) I should adjust current_pts when the video gets
                 // paused.
+                self.synchronization_info.current_pts.store(self.get_playing_current_pts(), Ordering::Relaxed);
             } else {
                 self.synchronization_info.last_pts_update.reset();
             }
