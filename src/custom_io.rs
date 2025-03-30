@@ -181,7 +181,7 @@ unsafe extern "C" fn callback_native_write<T: Write>(state: *mut c_void, buf: *c
 }
 
 
-unsafe extern "C" fn callback_native_seek<T: Seek>(state: *mut c_void, offset: c_long, whence: c_int) -> c_long {
+unsafe extern "C" fn callback_native_seek<T: Seek>(state: *mut c_void, offset: i64, whence: c_int) -> i64 {
     let callback = state as *mut T;
     let callback = &mut *callback;
 
