@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ffmpeg_the_third::codec::Id;
 use ffmpeg_the_third::format::{Pixel, Sample};
-use ffmpeg_the_third::ChannelLayoutMask;
+use ffmpeg_the_third::{ChannelLayoutMask, Rescale};
 use ffmpeg_the_third::{ffi::av_dump_format, format::context::input, media::Type};
 
 use ffmpeg_the_third::{self as ffmpeg, frame::Video as VideoFrame, frame::Audio as AudioFrame, frame::Frame, codec::decoder::opened::Opened as Decoder};
@@ -257,10 +257,12 @@ pub struct CpalParameters {
     channels: u16,
 }
 
-fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Option<CpalParameters>) -> Result<(StreamSink<AudioFrame>, CpalStreamArgs), AudioOutputError> {
+fn create_audio_output(time_base: ffmpeg::Rational, parameters: ffmpeg::codec::Parameters, output_format: Option<CpalParameters>) -> Result<(StreamSink<AudioFrame>, CpalStreamArgs), AudioOutputError> {
     let audio_ctx = ffmpeg::codec::Context::from_parameters(parameters).map_err(AudioOutputError::CreatingCodec)?;
     let audio_decoder = audio_ctx.decoder().audio().map_err(AudioOutputError::CreatingDecoder)?;
     println!("created audio decoder");
+    let audio_time_base = time_base;
+    assert_ne!(audio_time_base, ffmpeg::Rational::new(0, 1), "got no time base for audio");
 
     let cpal_format = output_format.as_ref().map(|x| x.format).unwrap_or(match audio_decoder.format() {
             Sample::None => panic!("unknown sample format"),
@@ -354,7 +356,7 @@ fn create_audio_output(parameters: ffmpeg::codec::Parameters, output_format: Opt
         // C code sucks.
         output.set_samples(0); // ensure that ffmpeg will put the number of samples into this buffer, instead of treating it as an input.
         repacker.run(input, output).expect("resampler failed");
-        output.set_pts(Some(next_pts));
+        output.set_pts(Some(next_pts.rescale(audio_time_base, MILLISECONDS_TIME_BASE)));
     }));
 
     // bizarre workaround for what i can only assume is a compiler bug
@@ -379,6 +381,8 @@ pub struct DecodeThreadArgs {
     cpal_sender: oneshot::Sender<CpalStreamArgs>,
 }
 
+const MILLISECONDS_TIME_BASE: ffmpeg::Rational = ffmpeg::Rational(1, 1_000);
+
 // TODO don't make this a public API please GOD do not make this a public API
 pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: DecodeThreadArgs) {
     //unsafe {av_dump_format(input.as_mut_ptr(), 0, c"<custom stream>".as_ptr(), 0);}
@@ -390,6 +394,8 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
     let mut video_machinery = input.streams()
         .best(Type::Video)
         .map(|video_stream| {
+        let video_time_base = video_stream.time_base();
+        assert_ne!(video_time_base, ffmpeg::Rational::new(0, 1), "got no time base for video");
         let video_ctx = ffmpeg::codec::Context::from_parameters(video_stream.parameters()).expect("unable to create video context");
         //let video_decoder = video_ctx.decoder().video().expect("unable to create video decoder");
         // FFmpeg's native VP9 decoder does not support transparency
@@ -409,7 +415,11 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
                 // in case the pixel format changes from YUV to YUVA.
                 let scaler = scaler.get_or_insert_with(|| frame_in.converter(Pixel::RGBA).expect("unable to create color converter"));
                 scaler.run(frame_in, frame_out).expect("scaler failed");
-                frame_out.set_pts(frame_in.pts());
+                frame_out.set_pts(
+                    frame_in
+                        .pts()
+                        .map(|pts| pts.rescale(video_time_base, MILLISECONDS_TIME_BASE)),
+                );
             }))),
             output_queue: Arc::new(RingBuf::new(40, || VideoFrame::empty(), "video")),
         };
@@ -420,7 +430,7 @@ pub fn video_decode_thread(input: &mut ffmpeg::format::context::Input, args: Dec
     let audio_stream = input.streams().best(Type::Audio);
 
     let mut audio_machinery: Option<(usize, StreamSink<AudioFrame>)> = audio_stream.as_ref().and_then(|stream| {
-        match create_audio_output(stream.parameters(), None) {
+        match create_audio_output(stream.time_base(), stream.parameters(), None) {
             Ok((streamsink, cpalstream)) => {
                 let _ = cpal_sender.send(cpalstream);
                 Some((stream.index(), streamsink))
