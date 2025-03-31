@@ -3,6 +3,17 @@ use std::ops::{Deref,DerefMut};
 
 use ffmpeg_the_third::Frame;
 
+#[cfg(debug_assertions)]
+#[derive(PartialEq,Eq,Debug,Clone,Copy)]
+struct RingBufID(u64);
+
+impl RingBufID {
+    fn next() -> Self {
+        static ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        RingBufID(ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 struct RingBufInner<T> {
     buffer: Box<[T]>,
     read_offset: usize,
@@ -127,12 +138,13 @@ impl<'a,T> Deref for NonNotifyingSlot<'a,T> {
 
 #[derive(Clone,Copy)]
 pub struct RingBufIndex {
-    iterator_ptr: *const (),
+    #[cfg(debug_assertions)] iterator_id: RingBufID,
     cursor: usize,
     wrap_state: WrapState,
 }
 
 pub struct ReadIterator<'a, T> {
+    id: RingBufID,
     guard: RingBufGuard<'a, T>,
     cursor: usize,
     wrap_state: WrapState,
@@ -146,7 +158,7 @@ impl<'a, T> ReadIterator<'a, T> {
         }
         let res = &self.guard.buffer[self.cursor];
         let index = RingBufIndex {
-            iterator_ptr: self as *const Self as *const (),
+            iterator_id: self.id,
             cursor: self.cursor,
             wrap_state: self.wrap_state,
         };
@@ -160,7 +172,7 @@ impl<'a, T> ReadIterator<'a, T> {
     }
 
     pub fn reset_to(&mut self, idx: RingBufIndex) {
-        debug_assert!(std::ptr::eq(idx.iterator_ptr, self as *const Self as *const _), "RingBufIndex may only be consumed by the same ReadIterator that created it");
+        debug_assert!(idx.iterator_id == self.id, "RingBufIndex may only be consumed by the same ReadIterator that created it");
         self.cursor = idx.cursor;
         self.wrap_state = idx.wrap_state;
     }
@@ -188,6 +200,10 @@ impl<'a, T> ReadIterator<'a, T> {
             return None;
         }
         Some(NonNotifyingSlot {guard: self.guard, slot: self.cursor})
+    }
+
+    pub fn _dbg_tmp_get_ptr(&self) -> *const () {
+        self as *const Self as *const ()
     }
 }
 
@@ -284,6 +300,7 @@ impl<T> RingBuf<T> {
             cursor: guard.read_offset,
             guard,
             condvar: &self.write_ready,
+            #[cfg(debug_assertions)] id: RingBufID::next(),
         }
     }
 
