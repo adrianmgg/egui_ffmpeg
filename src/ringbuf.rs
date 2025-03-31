@@ -7,6 +7,7 @@ use ffmpeg_the_third::Frame;
 #[derive(PartialEq,Eq,Debug,Clone,Copy)]
 struct RingBufID(u64);
 
+#[cfg(debug_assertions)]
 impl RingBufID {
     fn next() -> Self {
         static ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -144,7 +145,7 @@ pub struct RingBufIndex {
 }
 
 pub struct ReadIterator<'a, T> {
-    id: RingBufID,
+    #[cfg(debug_assertions)] id: RingBufID,
     guard: RingBufGuard<'a, T>,
     cursor: usize,
     wrap_state: WrapState,
@@ -158,7 +159,7 @@ impl<'a, T> ReadIterator<'a, T> {
         }
         let res = &self.guard.buffer[self.cursor];
         let index = RingBufIndex {
-            iterator_id: self.id,
+            #[cfg(debug_assertions)] iterator_id: self.id,
             cursor: self.cursor,
             wrap_state: self.wrap_state,
         };
@@ -172,7 +173,8 @@ impl<'a, T> ReadIterator<'a, T> {
     }
 
     pub fn reset_to(&mut self, idx: RingBufIndex) {
-        debug_assert!(idx.iterator_id == self.id, "RingBufIndex may only be consumed by the same ReadIterator that created it");
+        #[cfg(debug_assertions)]
+        assert!(idx.iterator_id == self.id, "RingBufIndex may only be consumed by the same ReadIterator that created it");
         self.cursor = idx.cursor;
         self.wrap_state = idx.wrap_state;
     }
