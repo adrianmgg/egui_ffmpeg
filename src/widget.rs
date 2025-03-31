@@ -120,6 +120,7 @@ impl VideoPlayerWidget {
             },
             None,
         )?;
+        stream.play().expect("failed to play audio stream");
         self.synchronization_info.audio_major.store(true, Ordering::Relaxed);
         Ok(stream)
     }

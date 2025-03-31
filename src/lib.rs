@@ -115,13 +115,13 @@ impl AudioPlayer {
                     }
                     let total_len = frame.samples() * self.bytes_per_sample;
                     let input_data = &frame.data(0)[self.offset_into_current_slot..total_len];
-                    self.offset_into_current_slot=0;
                     if input_data.len() > output_buffer.len() {
                         output_buffer.copy_from_slice(&input_data[..output_buffer.len()]);
-                        self.offset_into_current_slot = output_buffer.len();
+                        self.offset_into_current_slot += output_buffer.len();
                         frame.do_not_consume();
                         return (pts, false);
                     }
+                    self.offset_into_current_slot = 0;
                     output_buffer[..input_data.len()].copy_from_slice(input_data);
                     output_buffer = &mut output_buffer[input_data.len()..];
                 },
