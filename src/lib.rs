@@ -101,7 +101,7 @@ impl AudioPlayer {
     fn output(&mut self, mut output_buffer: &mut [u8]) -> (Option<i64>, bool) {
         let mut pts = None;
         while !output_buffer.is_empty() {
-            match self.queue.read() {
+            match self.queue.try_read() {
                 Ok(frame) => {
                     if pts.is_none() {
                         pts = frame.pts();

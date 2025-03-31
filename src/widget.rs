@@ -106,6 +106,9 @@ impl VideoPlayerWidget {
                         //let delta = dbg!(delta);
                         sync_info.current_pts.store(pts - delta.as_millis() as i64, Ordering::Relaxed);
                         sync_info.last_pts_update.reset();
+                        println!("pts update ok");
+                    } else {
+                        println!("no audio pts");
                     }
                     sync_info.audio_eof.store(done, Ordering::Relaxed);
                 } else {
@@ -147,6 +150,15 @@ impl VideoPlayerWidget {
             play_button_painter.rect_filled(Rect::EVERYTHING,Rounding::ZERO,Color32::GREEN);
         } else {
             play_button_painter.rect_filled(Rect::EVERYTHING,Rounding::ZERO,Color32::RED);
+        }
+    }
+}
+
+impl Drop for VideoPlayerWidget {
+    fn drop(&mut self) {
+        if let Some(v) = self.video_queue.try_load() {
+            // TODO do this properly by splitting the RingBuf into a read half and a write half and implementing `Drop` on that
+            v.close_read();
         }
     }
 }
@@ -195,7 +207,7 @@ impl egui::Widget for &mut VideoPlayerWidget {
                 time_to_next_frame = current_best.and_then(|(idx, _)| {
                     iter.reset_to(idx);
                     iter.next(); // this will return the pts we already know
-                    iter.next().and_then(|(_, frame)| frame.pts()).map(|next_pts| Duration::from_millis(next_pts as u64 - current_pts as u64))
+                    iter.next().and_then(|(_, frame)| frame.pts()).map(|next_pts| Duration::from_millis((next_pts - current_pts) as u64))
                 });
 
 
@@ -207,12 +219,12 @@ impl egui::Widget for &mut VideoPlayerWidget {
                 if let Some(frame) = slot {
                     if !self.last_pts.is_some_and(|pts| pts == frame.pts().unwrap()) {
                         let pixels = frame.plane::<[u8;4]>(0)
-                            .into_iter()
+                            .iter()
                             .copied()
                             .map(|[r,g,b,a]| Color32::from_rgba_unmultiplied(r,g,b,a))
                             .collect::<Vec<_>>();
                         let image = egui::ColorImage {
-                            size: [frame.stride(0) as usize / 4, frame.plane_height(0) as usize],
+                            size: [frame.stride(0) / 4, frame.plane_height(0) as usize],
                             pixels
                         };
                         let options = TextureOptions::LINEAR;
